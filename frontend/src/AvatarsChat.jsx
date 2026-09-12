@@ -932,6 +932,13 @@ export default function MultiAvatarChat() {
         Avatar Garden
       </motion.h1>
 
+      <Link
+        to="/avatars-chat-voice"
+        className="mb-4 inline-flex items-center gap-2 rounded-md bg-garden-water px-5 py-2 text-sm font-medium text-garden-paper hover:bg-garden-water/80 transition-colors"
+      >
+        🎙 Talk by voice
+      </Link>
+
       {/* Avatar and LLM selection + controls */}
       <div className="w-full max-w-5xl flex flex-col gap-4 mb-4 px-4">
         <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4">
