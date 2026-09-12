@@ -2107,7 +2107,8 @@ def start_voice_agent():
         # browser AEC, so full-duplex + barge-in is safe. Device clients send
         # parameters — no AEC guarantee -> half-duplex gate.
         full_duplex = not (isinstance(agent_parameters, dict) and agent_parameters)
-        return _start_orchestrator_session(avatar_id, channel, full_duplex)
+        return _start_orchestrator_session(avatar_id, channel, full_duplex,
+                                          codec=("opus" if full_duplex else "g722"))
 
     # Use avatar system prompt — trim sensor/function instructions (handled separately)
     system_prompt = avatar_llms[avatar_id].system_prompt
@@ -2228,7 +2229,7 @@ ORCH_LOG_DIR = "/root/AvatarGarden/orchestrator/logs"
 _orch_sessions = {}  # channel -> {"pid", "agent_id", "avatar_id", "started"}
 
 
-def _start_orchestrator_session(avatar_id, channel, full_duplex=False):
+def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g722"):
     """Spawn a VoiceSession process for this channel; adopt an existing one."""
     existing = _orch_sessions.get(channel)
     if existing:
@@ -2246,6 +2247,7 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False):
            "--idle", "180", "--max", "1800"]
     if full_duplex:
         cmd.append("--full-duplex")
+    cmd += ["--codec", codec]
     proc = subprocess.Popen(
         cmd, cwd=ORCH_DIR, stdout=log_f, stderr=subprocess.STDOUT,
         start_new_session=True)

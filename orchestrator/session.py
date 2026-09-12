@@ -60,7 +60,7 @@ class VoiceSession:
     def __init__(self, avatar_id, channel, token, app_id,
                  deepgram_key, cartesia_key, tts_voice_id,
                  backend_base="http://127.0.0.1:5001",
-                 language="multi", full_duplex=False, log=print):
+                 language="multi", full_duplex=False, codec="g722", log=print):
         self.avatar_id = str(avatar_id)
         self.channel = channel
         self.token = token
@@ -71,6 +71,7 @@ class VoiceSession:
         self.backend = backend_base
         self.language = language
         self.full_duplex = full_duplex   # web (AEC) -> True; device -> False
+        self.codec = codec               # "g722" (device) | "opus" (web)
         self.log = log
         self.messages = []               # OpenAI-format turns (backend injects system prompt)
 
@@ -85,6 +86,10 @@ class VoiceSession:
         self._last_activity = time.monotonic()
         self._turn_active = False
         self._enc = g722.G722Encoder()
+        self._opus = None
+        if codec == "opus":
+            import opuslib_next as op
+            self._opus = op.Encoder(16000, 1, op.APPLICATION_AUDIO)
 
     # ------------------------- SDK thread -------------------------
     def _sdk_thread(self):
@@ -154,20 +159,28 @@ class VoiceSession:
             pcm = self._tts(text)
             if pcm and gen == self._gen:
                 self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
-                         f"({len(pcm) // 3200:.1f}s audio)")
+                         f"({len(pcm) // 32000:.1f}s audio)")
                 if len(pcm) % (2 * 320):
                     pcm += b"\x00" * (640 - len(pcm) % 640)
                 samples = array.array("h")
                 samples.frombytes(pcm)
-                audio = self._enc.encode(samples)
-                frames = [audio[i:i + 160] for i in range(0, len(audio) - 159, 160)]
+                if self._opus is not None:
+                    # one opus packet per 20 ms frame — packets are
+                    # variable-length and MUST be pushed individually
+                    frames = [self._opus.encode(bytes(samples[k:k + 320]), 320)
+                              for k in range(0, len(samples) - 319, 320)]
+                else:
+                    audio = self._enc.encode(samples)
+                    frames = [audio[i:i + 160] for i in range(0, len(audio) - 159, 160)]
                 self._pcm_q.put((gen, frames))
                 self.log(f"[orch] tts ok gen{gen} ({len(pcm)} B): {text[:50]!r}")
 
     def _publisher(self, conn):
         """Frame pump on an ABSOLUTE 20 ms schedule (drift-free playback)."""
+        codec_type = (AudioCodecType.AUDIO_CODEC_OPUS if self._opus is not None
+                      else AudioCodecType.AUDIO_CODEC_G722)
         frame_info = EncodedAudioFrameInfo(
-            codec=AudioCodecType.AUDIO_CODEC_G722, sample_rate=RATE,
+            codec=codec_type, sample_rate=RATE,
             samples_per_channel=FRAME_SAMPLES, number_of_channels=1,
             send_even_if_empty=1)
         threads = [threading.Thread(target=self._tts_worker, daemon=True)]
@@ -314,6 +327,7 @@ class VoiceSession:
 
         self.log(f"[orch] live: avatar={self.avatar_id} channel={self.channel} "
                  f"mode={'full-duplex' if self.full_duplex else 'half-duplex'} "
+                 f"codec={self._opus and 'opus' or 'g722'} "
                  f"idle={idle_timeout_s}s")
         t_start = time.monotonic()
         while True:
