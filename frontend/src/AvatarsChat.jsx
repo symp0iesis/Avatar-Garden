@@ -494,6 +494,23 @@ export default function MultiAvatarChat() {
 
   const selectedAvatar = avatars.find(a => a.id === selectedAvatarId) || null;
   const keywordLlmOn = selectedAvatar ? selectedAvatar.keywordMode === "llm" : true;
+  const vpsVoiceOn = selectedAvatar ? (selectedAvatar.llmDefaults?.voiceBackend === "vps") : false;
+
+  const handleToggleVoiceBackend = async (checked) => {
+    if (!selectedAvatarId) return;
+    try {
+      const resp = await fetch(`/api/avatars/${selectedAvatarId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voiceBackend: checked ? "vps" : "convoai" }),
+      });
+      if (!resp.ok) throw new Error((await resp.json()).error || "Save failed");
+      const updated = await fetch("/api/avatars").then(r => r.json());
+      setAvatars(updated);
+    } catch (e) {
+      console.error("Failed to toggle voice backend:", e);
+    }
+  };
 
   const handleToggleKeywordMode = async (checked) => {
     if (!selectedAvatarId) return;
@@ -1128,6 +1145,28 @@ export default function MultiAvatarChat() {
                               );
                           })}
                       </select>
+                  </div>
+              </div>
+
+              {/* Voice engine routing (Fase 5) */}
+              <div className="p-3 rounded-lg border bg-garden-paper2">
+                  <label className="block font-poetic text-garden-ink font-semibold text-sm mb-2">Voice engine</label>
+                  <div className="flex items-center gap-3">
+                      <Switch
+                          checked={vpsVoiceOn}
+                          disabled={!selectedAvatarId}
+                          onCheckedChange={handleToggleVoiceBackend}
+                          className="data-[state=checked]:bg-garden-moss"
+                      />
+                      {vpsVoiceOn ? (
+                        <span className="font-poetic text-garden-inksoft text-xs">
+                          VPS-hosted orchestrator (runs on this server; experimental)
+                        </span>
+                      ) : (
+                        <span className="font-poetic text-garden-inksoft text-xs">
+                          Agora ConvoAI (cloud, default)
+                        </span>
+                      )}
                   </div>
               </div>
 

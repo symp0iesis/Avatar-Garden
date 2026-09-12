@@ -297,7 +297,9 @@ export default function AvatarsChatVoice() {
               ))}
             </select>
           </div>
-          {/* Streaming toggle — applies to the next conversation start */}
+          {/* Streaming toggle — ConvoAI sessions only (the VPS orchestrator always
+              streams); applies to the next conversation start */}
+          {!isConnected && selectedAvatar?.llmDefaults?.voiceBackend !== "vps" && (
           <div className="flex items-center justify-between p-3 rounded-lg border border-garden-line bg-garden-paper2">
             <div className="pr-3">
               <p className="font-poetic text-garden-ink text-sm font-medium">Streaming responses</p>
@@ -312,6 +314,7 @@ export default function AvatarsChatVoice() {
               <span className={"absolute top-0.5 left-0.5 w-5 h-5 bg-garden-paper rounded-full shadow transition-transform duration-200 " + (streamingEnabled ? "translate-x-5" : "translate-x-0")} />
             </button>
           </div>
+          )}
         </div>
       )}
 

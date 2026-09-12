@@ -4,6 +4,8 @@ import json
 import os
 import re
 import threading
+import signal
+import subprocess
 import time
 from datetime import datetime
 
@@ -1615,6 +1617,9 @@ def avatar_detail(avatar_id):
                   "ttsVoiceId", "ttsLanguage", "ragPinned", "keywordMode"]:
         if field in data and data[field] is not None:
             avatar[field] = data[field]
+    # voiceBackend lives in llmDefaults (capability flag next to webSearchEnabled)
+    if data.get("voiceBackend"):
+        avatar.setdefault("llmDefaults", {})["voiceBackend"] = str(data["voiceBackend"]).lower()
 
     # Handle ragLanguages separately (comma-separated string to list)
     if "ragLanguages" in data and data["ragLanguages"] is not None:
@@ -1681,7 +1686,8 @@ def avatar_llm_defaults(avatar_id):
             # webSearchEnabled is a capability flag, not a model default — it must
             # survive clearing Admin defaults. (2026-09-11: wiping the whole dict
             # re-enabled web search for avatars explicitly set to false.)
-            preserved = {k: v for k, v in avatar["llmDefaults"].items() if k == "webSearchEnabled"}
+            preserved = {k: v for k, v in avatar["llmDefaults"].items()
+                        if k in ("webSearchEnabled", "voiceBackend")}
             if preserved:
                 avatar["llmDefaults"] = preserved
             else:
@@ -2065,7 +2071,13 @@ def get_voice_token():
 
 @voice_bp.route("/api/voice/agent/start", methods=["POST"])
 def start_voice_agent():
-    """Start an Agora Conversational AI agent for the given avatar and channel."""
+    """Start a voice agent for the given avatar and channel.
+
+    Routed by the avatar's voiceBackend (admin default, LLM Config -> Voice):
+    - "convoai" (default): Agora Conversational AI agent (cloud, uid 999)
+    - "vps": self-hosted orchestrator session (agora-python-server-sdk, uid 777,
+      same LLM brain via localhost callback) — Fase 5 routing
+    """
     data = request.get_json() or {}
     avatar_id = str(data.get("avatarId", "0"))
     channel = data.get("channel", "avatar-lab")
@@ -2081,6 +2093,11 @@ def start_voice_agent():
     # Load admin defaults to determine TTS voice etc.
     avatars = json.load(open(avatars_path, "r"))
     avatar = next((a for a in avatars if a["id"] == avatar_id), None)
+
+    voice_backend = str((avatar or {}).get("llmDefaults", {}).get(
+        "voiceBackend", "convoai")).lower()
+    if voice_backend == "vps":
+        return _start_orchestrator_session(avatar_id, channel)
 
     # Use avatar system prompt — trim sensor/function instructions (handled separately)
     system_prompt = avatar_llms[avatar_id].system_prompt
@@ -2156,6 +2173,15 @@ def start_voice_agent():
                         "mode": "id",
                         "id": (avatar.get("ttsVoiceId") if avatar else None) or DEFAULT_TTS_VOICE_ID,
                     },
+                    # 12/Sep: explicit 16 kHz mono PCM output — Cartesia's
+                    # default (44.1 kHz) played through the G722/16 kHz RTC
+                    # pipeline sounds ~2.8x fast (chipmunk). Mirrors the
+                    # validated start_g722_agent.py payload.
+                    "output_format": {
+                        "container": "raw",
+                        "encoding": "pcm_s16le",
+                        "sample_rate": 16000,
+                    },
                     # Synthesis language hint (Cartesia defaults to "en" when
                     # absent, even for non-English reply text).
                     "language": (avatar.get("ttsLanguage") if avatar else None) or DEFAULT_TTS_LANGUAGE,
@@ -2185,13 +2211,68 @@ def start_voice_agent():
     return jsonify({"agentId": agent_id, "channel": channel})
 
 
+# --- VPS-hosted orchestrator sessions (voiceBackend: "vps", Fase 5) ---
+ORCH_DIR = "/root/AvatarGarden/orchestrator"
+ORCH_PY = "/root/agora-orchestrator-venv/bin/python"
+ORCH_LOG_DIR = "/root/AvatarGarden/orchestrator/logs"
+_orch_sessions = {}  # channel -> {"pid", "agent_id", "avatar_id", "started"}
+
+
+def _start_orchestrator_session(avatar_id, channel):
+    """Spawn a VoiceSession process for this channel; adopt an existing one."""
+    existing = _orch_sessions.get(channel)
+    if existing:
+        try:
+            os.kill(existing["pid"], 0)
+            print(f"[Voice] Orchestrator already live for {channel} "
+                  f"(pid {existing['pid']}) — adopt")
+            return jsonify({"agentId": existing["agent_id"], "channel": channel})
+        except OSError:
+            _orch_sessions.pop(channel, None)
+    os.makedirs(ORCH_LOG_DIR, exist_ok=True)
+    log_f = open(os.path.join(ORCH_LOG_DIR, f"{channel}.log"), "ab")
+    proc = subprocess.Popen(
+        [ORCH_PY, "-u", "orchestrator_main.py",
+         "--avatar", str(avatar_id), "--channel", channel,
+         "--idle", "180", "--max", "1800"],
+        cwd=ORCH_DIR, stdout=log_f, stderr=subprocess.STDOUT,
+        start_new_session=True)
+    agent_id = f"vps-{proc.pid}"
+    _orch_sessions[channel] = {"pid": proc.pid, "agent_id": agent_id,
+                               "avatar_id": avatar_id, "started": time.time()}
+    print(f"[Voice] VPS orchestrator started: channel={channel} pid={proc.pid}")
+    return jsonify({"agentId": agent_id, "channel": channel})
+
+
 @voice_bp.route("/api/voice/agent/stop", methods=["POST"])
 def stop_voice_agent():
-    """Stop a running Agora Conversational AI agent."""
+    """Stop a running voice agent (Agora ConvoAI or a VPS orchestrator session)."""
     data = request.get_json() or {}
     agent_id = data.get("agentId")
     if not agent_id:
         return jsonify({"error": "agentId required"}), 400
+
+    # VPS orchestrator sessions: agentId "vps-<pid>" (registry keeps the map)
+    if str(agent_id).startswith("vps-"):
+        pid = None
+        try:
+            pid = int(str(agent_id)[4:])
+        except ValueError:
+            for ch, s in list(_orch_sessions.items()):
+                if s["agent_id"] == agent_id:
+                    pid = s["pid"]
+                    _orch_sessions.pop(ch, None)
+                    break
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                print(f"[Voice] VPS orchestrator stopped: pid {pid}")
+            except OSError as e:
+                print(f"[Voice] VPS orchestrator stop failed: {e}")
+        for ch, s in list(_orch_sessions.items()):
+            if s["pid"] == pid:
+                _orch_sessions.pop(ch, None)
+        return jsonify({"status": "stopped"})
 
     resp = requests.post(
         f"{AGORA_CONV_AI_BASE}/{get_integration_key('AGORA_APP_ID')}/agents/{agent_id}/leave",
