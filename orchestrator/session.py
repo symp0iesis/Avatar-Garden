@@ -150,8 +150,11 @@ class VoiceSession:
                 continue
             if gen != self._gen:
                 continue  # barged in — drop stale sentence
+            _t0 = time.monotonic()
             pcm = self._tts(text)
             if pcm and gen == self._gen:
+                self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
+                         f"({len(pcm) // 3200:.1f}s audio)")
                 if len(pcm) % (2 * 320):
                     pcm += b"\x00" * (640 - len(pcm) % 640)
                 samples = array.array("h")
@@ -241,6 +244,7 @@ class VoiceSession:
 
     def _run_turn(self, text, gen):
         t0 = time.monotonic()
+        first_delta_t = None
         try:
             self.messages.append({"role": "user", "content": text})
             resp = requests.post(
@@ -266,6 +270,10 @@ class VoiceSession:
                     continue
                 delta = ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content")
                 if delta:
+                    if first_delta_t is None:
+                        first_delta_t = time.monotonic()
+                        self.log(f"[TIMING] first LLM sentence ready: "
+                                 f"{first_delta_t - t0:.2f}s")
                     self._sentence_q.put((gen, delta))
                     reply_parts.append(delta)
             resp.close()
