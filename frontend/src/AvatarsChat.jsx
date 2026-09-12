@@ -357,6 +357,7 @@ export default function MultiAvatarChat() {
           sensorModel: currentUserSensorModel,
           voiceChatProvider: currentUserVoiceChatProvider,
           voiceChatModel: currentUserVoiceChatModel,
+          voiceBackend: vpsVoiceOn ? "vps" : "convoai",
         }),
       });
 

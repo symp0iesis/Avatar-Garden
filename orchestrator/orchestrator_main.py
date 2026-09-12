@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--channel", required=True)
     ap.add_argument("--idle", type=int, default=180)
     ap.add_argument("--max", type=int, default=600)
+    ap.add_argument("--full-duplex", action="store_true",
+                    help="web client (browser AEC): keep uplink during downlink, allow barge-in")
     args = ap.parse_args()
 
     env = load_env()
@@ -52,7 +54,8 @@ def main():
         avatar_id=args.avatar, channel=args.channel, token=creds["token"],
         app_id=creds["appId"], deepgram_key=env["DEEPGRAM_API_KEY"],
         cartesia_key=env["CARTESIA_API_KEY"],
-        tts_voice_id=av.get("ttsVoiceId") or "default")
+        tts_voice_id=av.get("ttsVoiceId") or "default",
+        full_duplex=args.full_duplex)
     s.run(idle_timeout_s=args.idle, max_duration_s=args.max)
     return 0
 

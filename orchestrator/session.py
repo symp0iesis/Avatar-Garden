@@ -1,25 +1,32 @@
 """
-Self-hosted voice session (Fases 3+4): the full VPS-hosted avatar loop.
+Self-hosted voice session (Fases 3-5): the full VPS-hosted avatar loop.
 
     Agora channel (SD-RTN — transport unchanged)
       uplink (device uid 1 / web uid 2+), decoded PCM frames
-        -> half-duplex gate (discarded while the avatar speaks)
         -> DeepgramStreamer nova-3, endpointing 500 ms            [Fase 2]
         -> utterance
         -> POST localhost /api/voice/chat-completions?avatar=X&streaming=1
            (RAG + sensors + species + weather + keyword modes: same brain) [Fase 3]
         -> SSE sentence deltas
-        -> Cartesia sonic-3 (.ai) per-sentence TTS                [Fase 4]
+        -> Cartesia sonic-3 (.ai) per-sentence TTS (prefetched, pipelined) [Fase 4]
         -> pure-Python G722 encoder (160 B per 320-sample frame)  [Fase 1]
-        -> push_audio_encoded_data, paced 20 ms                   [PoC-validated]
+        -> push_audio_encoded_data, absolute-clock paced 20 ms    [PoC-validated]
 
-Half-duplex: uplink muted while the avatar speaks (AIVAD is ConvoAI-side;
-this is ours — transport-agnostic lesson #2). Auto-idle ends the session
-after idle_timeout_s without user speech (native cost-guard).
+Audio path model (2026-09-12, from first live feedback):
+- Playback is driven by an ABSOLUTE schedule (frame N at t0 + N*20 ms), not
+  sleep(0.02)-after-push — drift made speech slow and jittery.
+- TTS is PIPELINED: a worker fetches sentence N+1 while N is being pushed;
+  inter-sentence gaps were heard as jitter.
+- Barge-in (full-duplex, web sessions with AEC): uplink keeps feeding ASR
+  while the avatar speaks; a new utterance bumps the turn generation —
+  stale sentences/frames are dropped at 20 ms granularity.
+- Half-duplex (device, no AEC): uplink discarded during downlink, with a
+  tail-silence reopen delay. Transport-agnostic lesson #2.
+Auto-idle ends the session after idle_timeout_s without user speech.
 """
 import asyncio
-import array
 import json
+import array
 import queue
 import threading
 import time
@@ -53,7 +60,7 @@ class VoiceSession:
     def __init__(self, avatar_id, channel, token, app_id,
                  deepgram_key, cartesia_key, tts_voice_id,
                  backend_base="http://127.0.0.1:5001",
-                 language="multi", log=print):
+                 language="multi", full_duplex=False, log=print):
         self.avatar_id = str(avatar_id)
         self.channel = channel
         self.token = token
@@ -63,20 +70,21 @@ class VoiceSession:
         self.tts_voice_id = tts_voice_id
         self.backend = backend_base
         self.language = language
+        self.full_duplex = full_duplex   # web (AEC) -> True; device -> False
         self.log = log
-        self.messages = []            # OpenAI-format turns (no system prompt: backend injects it)
+        self.messages = []               # OpenAI-format turns (backend injects system prompt)
 
         self._uplink_q = queue.Queue()
-        self._tts_q = queue.Queue()   # text sentences -> publisher thread
+        self._sentence_q = queue.Queue() # (gen, text)     -> tts worker
+        self._pcm_q = queue.Queue()      # (gen, g722 frames) -> publisher
         self._muted = threading.Event()
-        self._stop_publish = threading.Event()
+        self._stop = threading.Event()
         self._sdk_ready = threading.Event()
+        self._gen = 0                    # barge-in generation
         self._last_push = 0.0
         self._last_activity = time.monotonic()
         self._turn_active = False
         self._enc = g722.G722Encoder()
-        self._conn = None
-        self._svc = None
 
     # ------------------------- SDK thread -------------------------
     def _sdk_thread(self):
@@ -84,7 +92,6 @@ class VoiceSession:
         svc_cfg.app_id = self.app_id
         svc = AgoraService()
         assert svc.initialize(svc_cfg) == 0
-        self._svc = svc
         conn_cfg = RTCConnConfig(
             client_role_type=ClientRoleType.CLIENT_ROLE_BROADCASTER,
             channel_profile=ChannelProfileType.CHANNEL_PROFILE_LIVE_BROADCASTING,
@@ -113,49 +120,71 @@ class VoiceSession:
 
         class Rec(IAudioFrameObserver):
             def on_playback_audio_frame_before_mixing(self, _l, _c, uid, frame, _v=0, _d=None):
-                # decoded PCM of remote users (the uplink), before mixing
-                if not session._muted.is_set():
+                # decoded uplink PCM of remote users (before mixing).
+                # Full-duplex: always feed (browser AEC removes our downlink).
+                # Half-duplex: discard while the avatar speaks.
+                if session.full_duplex or not session._muted.is_set():
                     session._uplink_q.put(bytes(frame.buffer))
                 return 1
 
         conn.register_observer(Obs())
-        conn.connect(self.token, self.channel, str(ORCH_UID))
+        conn.connect(self.token, self.channel, str(777))
         lu = conn.get_local_user()
         lu.set_playback_audio_frame_before_mixing_parameters(1, RATE)
         conn.register_audio_frame_observer(Rec(), 0, None)
         conn.publish_audio()
         self._conn = conn
         self._sdk_ready.set()
-
-        # publisher: sentence text -> TTS -> G722 frames -> push (paced 20 ms)
-        frame_info = EncodedAudioFrameInfo(
-            codec=AudioCodecType.AUDIO_CODEC_G722, sample_rate=RATE,
-            samples_per_channel=FRAME_SAMPLES, number_of_channels=1,
-            send_even_if_empty=1)
-        while not self._stop_publish.is_set():
-            try:
-                text = self._tts_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            pcm = self._tts(text)
-            if not pcm:
-                continue
-            self.log(f"[orch] TTS ok ({len(pcm)} B): {text[:60]!r}")
-            # pad to whole 20 ms frames, convert to int16 samples, encode
-            if len(pcm) % (2 * FRAME_SAMPLES):
-                pcm = pcm + b"\x00" * (640 - len(pcm) % 640)
-            samples = array.array("h")
-            samples.frombytes(pcm)
-            audio = self._enc.encode(samples)
-            for i in range(0, len(audio) - FRAME_BYTES + 1, FRAME_BYTES):
-                if self._stop_publish.is_set():
-                    break
-                conn.push_audio_encoded_data(audio[i:i + FRAME_BYTES], frame_info)
-                time.sleep(0.02)
-            self._last_push = time.monotonic()
+        self._publisher(conn)
         conn.disconnect()
         conn.release()
-        svc.release()
+
+    # ------------------------- audio out (worker + publisher) -------------------------
+    def _tts_worker(self):
+        """Sentence text -> Cartesia PCM (prefetch pipeline)."""
+
+        while not self._stop.is_set():
+            try:
+                gen, text = self._sentence_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if gen != self._gen:
+                continue  # barged in — drop stale sentence
+            pcm = self._tts(text)
+            if pcm and gen == self._gen:
+                if len(pcm) % (2 * 320):
+                    pcm += b"\x00" * (640 - len(pcm) % 640)
+                samples = array.array("h")
+                samples.frombytes(pcm)
+                audio = self._enc.encode(samples)
+                frames = [audio[i:i + 160] for i in range(0, len(audio) - 159, 160)]
+                self._pcm_q.put((gen, frames))
+                self.log(f"[orch] tts ok gen{gen} ({len(pcm)} B): {text[:50]!r}")
+
+    def _publisher(self, conn):
+        """Frame pump on an ABSOLUTE 20 ms schedule (drift-free playback)."""
+        threads = [threading.Thread(target=self._tts_worker, daemon=True)]
+        for t in threads:
+            t.start()
+        while not self._stop.is_set():
+            try:
+                gen, frames = self._pcm_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if gen != self._gen:
+                continue  # barged in
+            next_t = time.monotonic()
+            pushed = 0
+            for f in frames:
+                if self._stop.is_set() or gen != self._gen:
+                    break  # barged mid-sentence — stop at 20 ms granularity
+                conn.push_audio_encoded_data(f, frame_info)
+                pushed += 1
+                next_t += 0.02
+                delay = next_t - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+            self._last_push = time.monotonic()
 
     def _tts(self, text):
         try:
@@ -174,18 +203,36 @@ class VoiceSession:
             self.log(f"[orch] TTS failed: {e}")
             return b""
 
-    # ------------------------- LLM turn -------------------------
-    def _on_utterance(self, text):
-        if self._turn_active:
-            self.log(f"[orch] utterance dropped (turn in progress): {text!r}")
-            return
-        self.log(f"[orch] utterance: {text!r}")
-        self._last_activity = time.monotonic()
-        self._turn_active = True
-        self._muted.set()
-        threading.Thread(target=self._run_turn, args=(text,), daemon=True).start()
+    def _speaking(self):
+        if not self._pcm_q.empty() or not self._sentence_q.empty():
+            return True
+        return (time.monotonic() - self._last_push) < TAIL_SILENCE_S
 
-    def _run_turn(self, text):
+    # ------------------------- turns -------------------------
+    def _on_utterance(self, text):
+        self._last_activity = time.monotonic()
+        speaking = self._speaking() or self._turn_active
+        if speaking:
+            # BARGE-IN: bump generation — publisher drops current sentence at
+            # 20 ms granularity, stale TTS/discarded deltas are ignored.
+            self.log(f"[orch] BARGE-IN: {text!r}")
+            self._gen += 1
+            self._drain(self._sentence_q)
+            self._drain(self._pcm_q)
+            self._last_push = 0.0
+        if self._turn_active:
+            return  # previous turn thread cleans up; this utterance handled next
+        self._turn_active = True
+        threading.Thread(target=self._run_turn, args=(text, self._gen), daemon=True).start()
+
+    def _drain(self, q):
+        try:
+            while True:
+                q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _run_turn(self, text, gen):
         t0 = time.monotonic()
         try:
             self.messages.append({"role": "user", "content": text})
@@ -203,32 +250,36 @@ class VoiceSession:
                 payload = line[6:].strip()
                 if payload == "[DONE]":
                     break
+                if gen != self._gen:
+                    reply_parts = []  # barged in mid-stream — discard
+                    break
                 try:
                     chunk = json.loads(payload)
                 except ValueError:
                     continue
                 delta = ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content")
                 if delta:
-                    self._tts_q.put(delta)
+                    self._sentence_q.put((gen, delta))
                     reply_parts.append(delta)
             resp.close()
             reply = "".join(reply_parts).strip()
-            if reply:
+            if reply and gen == self._gen:
                 self.messages.append({"role": "assistant", "content": reply})
             self.log(f"[TIMING] utterance->stream done: {time.monotonic() - t0:.2f}s; "
-                     f"reply {len(reply)} chars")
+                     f"reply {len(reply)} chars (gen {gen})")
         except Exception as e:
             self.log(f"[orch] LLM turn failed: {e}")
         finally:
-            # wait until TTS publisher drains + tail, then reopen uplink
-            while not self._tts_q.empty():
-                time.sleep(0.05)
-            time.sleep(max(0.0, TAIL_SILENCE_S - (time.monotonic() - self._last_push)))
-            self._muted.clear()
+            # wait for TTS drain + tail, then reopen uplink (half-duplex only)
+            if not self.full_duplex:
+                while self._speaking():
+                    time.sleep(0.05)
+                self._muted.clear()
             self._turn_active = False
 
     # ------------------------- session loop -------------------------
     def run(self, idle_timeout_s=IDLE_TIMEOUT_S, max_duration_s=MAX_DURATION_S):
+        self._sdk_ready = threading.Event()
         t_sdk = threading.Thread(target=self._sdk_thread, daemon=True)
         t_sdk.start()
         self._sdk_ready.wait(20)
@@ -247,6 +298,7 @@ class VoiceSession:
         asyncio.run_coroutine_threadsafe(streamer.connect(), loop).result(15)
 
         self.log(f"[orch] live: avatar={self.avatar_id} channel={self.channel} "
+                 f"mode={'full-duplex' if self.full_duplex else 'half-duplex'} "
                  f"idle={idle_timeout_s}s")
         t_start = time.monotonic()
         while True:
@@ -255,7 +307,7 @@ class VoiceSession:
                 self.log("[orch] max duration reached — ending session")
                 break
             if (not self._turn_active and now - self._last_activity > idle_timeout_s
-                    and not self._tts_busy()):
+                    and not self._speaking()):
                 self.log("[orch] auto-idle — ending session")
                 break
             try:
@@ -267,11 +319,6 @@ class VoiceSession:
 
         asyncio.run_coroutine_threadsafe(streamer.close(), loop).result(10)
         loop.call_soon_threadsafe(loop.stop)
-        self._stop_publish.set()
+        self._stop.set()
         t_sdk.join(timeout=10)
         self.log("[orch] session ended")
-
-    def _tts_busy(self):
-        if not self._tts_q.empty():
-            return True
-        return (time.monotonic() - self._last_push) < TAIL_SILENCE_S

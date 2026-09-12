@@ -1687,7 +1687,7 @@ def avatar_llm_defaults(avatar_id):
             # survive clearing Admin defaults. (2026-09-11: wiping the whole dict
             # re-enabled web search for avatars explicitly set to false.)
             preserved = {k: v for k, v in avatar["llmDefaults"].items()
-                        if k in ("webSearchEnabled", "voiceBackend")}
+                        if k == "webSearchEnabled"}
             if preserved:
                 avatar["llmDefaults"] = preserved
             else:
@@ -1721,10 +1721,16 @@ def avatar_llm_defaults(avatar_id):
         }
     }
 
+    # Voice backend routing is part of the Admin Defaults payload
+    if data.get("voiceBackend"):
+        incoming["voiceBackend"] = str(data["voiceBackend"]).lower()
+
     # Merge into existing defaults rather than replacing wholesale — a payload
     # missing a task's fields must not wipe that task (avatars.json lost
     # defaults twice on 2026-08-11 to partial/implicit saves; see ISSUES.md 13).
     llm_defaults = dict(avatar.get("llmDefaults", {}))
+    if "voiceBackend" in incoming:
+        llm_defaults["voiceBackend"] = incoming.pop("voiceBackend")
     for task, cfg in incoming.items():
         cfg = {k: v for k, v in cfg.items() if v is not None}
         if cfg.get("model") or cfg.get("provider"):
@@ -2097,7 +2103,11 @@ def start_voice_agent():
     voice_backend = str((avatar or {}).get("llmDefaults", {}).get(
         "voiceBackend", "convoai")).lower()
     if voice_backend == "vps":
-        return _start_orchestrator_session(avatar_id, channel)
+        # Web clients omit `parameters` (no output_audio_codec) — they have
+        # browser AEC, so full-duplex + barge-in is safe. Device clients send
+        # parameters — no AEC guarantee -> half-duplex gate.
+        full_duplex = not (isinstance(agent_parameters, dict) and agent_parameters)
+        return _start_orchestrator_session(avatar_id, channel, full_duplex)
 
     # Use avatar system prompt — trim sensor/function instructions (handled separately)
     system_prompt = avatar_llms[avatar_id].system_prompt
@@ -2218,7 +2228,7 @@ ORCH_LOG_DIR = "/root/AvatarGarden/orchestrator/logs"
 _orch_sessions = {}  # channel -> {"pid", "agent_id", "avatar_id", "started"}
 
 
-def _start_orchestrator_session(avatar_id, channel):
+def _start_orchestrator_session(avatar_id, channel, full_duplex=False):
     """Spawn a VoiceSession process for this channel; adopt an existing one."""
     existing = _orch_sessions.get(channel)
     if existing:
@@ -2231,11 +2241,13 @@ def _start_orchestrator_session(avatar_id, channel):
             _orch_sessions.pop(channel, None)
     os.makedirs(ORCH_LOG_DIR, exist_ok=True)
     log_f = open(os.path.join(ORCH_LOG_DIR, f"{channel}.log"), "ab")
+    cmd = [ORCH_PY, "-u", "orchestrator_main.py",
+           "--avatar", str(avatar_id), "--channel", channel,
+           "--idle", "180", "--max", "1800"]
+    if full_duplex:
+        cmd.append("--full-duplex")
     proc = subprocess.Popen(
-        [ORCH_PY, "-u", "orchestrator_main.py",
-         "--avatar", str(avatar_id), "--channel", channel,
-         "--idle", "180", "--max", "1800"],
-        cwd=ORCH_DIR, stdout=log_f, stderr=subprocess.STDOUT,
+        cmd, cwd=ORCH_DIR, stdout=log_f, stderr=subprocess.STDOUT,
         start_new_session=True)
     agent_id = f"vps-{proc.pid}"
     _orch_sessions[channel] = {"pid": proc.pid, "agent_id": agent_id,
