@@ -83,6 +83,7 @@ class VoiceSession:
         self._sdk_ready = threading.Event()
         self._gen = 0                    # barge-in generation
         self._last_push = 0.0
+        self._push_busy = False
         self._last_activity = time.monotonic()
         self._turn_active = False
         self._enc = g722.G722Encoder()
@@ -196,6 +197,7 @@ class VoiceSession:
             try:
                 next_t = time.monotonic()
                 pushed = 0
+                self._push_busy = True
                 for f in frames:
                     if self._stop.is_set() or gen != self._gen:
                         break  # barged mid-sentence — stop at 20 ms granularity
@@ -205,6 +207,7 @@ class VoiceSession:
                     delay = next_t - time.monotonic()
                     if delay > 0:
                         time.sleep(delay)
+                self._push_busy = False
                 self._last_push = time.monotonic()
             except Exception as e:
                 self.log(f"[orch] publisher error: {e}")
@@ -243,6 +246,7 @@ class VoiceSession:
             self._drain(self._sentence_q)
             self._drain(self._pcm_q)
             self._last_push = 0.0
+        self._push_busy = False
         if self._turn_active:
             return  # previous turn thread cleans up; this utterance handled next
         self._turn_active = True
@@ -298,9 +302,17 @@ class VoiceSession:
         except Exception as e:
             self.log(f"[orch] LLM turn failed: {e}")
         finally:
-            # wait for TTS drain + tail, then reopen uplink (half-duplex only)
+            # half-duplex: reopen uplink once the PUSH SCHEDULE finishes (the
+            # queue may still hold text being fetched/encoded — but audio
+            # already queued continues pushing; waiting for full drain left
+            # seconds of dead mic on long replies, felt as "slow to respond").
             if not self.full_duplex:
-                while self._speaking():
+                last_reply = getattr(self, "_reply_gen", None)
+                # wait for this turn's last sentence to be ENCODED (not played):
+                while self._sentence_q.qsize() > 0 or self._pcm_q.qsize() > 0:
+                    time.sleep(0.05)
+                # wait for the publisher to finish PLAYING what it holds
+                while self._push_busy:
                     time.sleep(0.05)
                 self._muted.clear()
             self._turn_active = False
