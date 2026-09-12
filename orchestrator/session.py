@@ -163,6 +163,10 @@ class VoiceSession:
 
     def _publisher(self, conn):
         """Frame pump on an ABSOLUTE 20 ms schedule (drift-free playback)."""
+        frame_info = EncodedAudioFrameInfo(
+            codec=AudioCodecType.AUDIO_CODEC_G722, sample_rate=RATE,
+            samples_per_channel=FRAME_SAMPLES, number_of_channels=1,
+            send_even_if_empty=1)
         threads = [threading.Thread(target=self._tts_worker, daemon=True)]
         for t in threads:
             t.start()
@@ -173,18 +177,21 @@ class VoiceSession:
                 continue
             if gen != self._gen:
                 continue  # barged in
-            next_t = time.monotonic()
-            pushed = 0
-            for f in frames:
-                if self._stop.is_set() or gen != self._gen:
-                    break  # barged mid-sentence — stop at 20 ms granularity
-                conn.push_audio_encoded_data(f, frame_info)
-                pushed += 1
-                next_t += 0.02
-                delay = next_t - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-            self._last_push = time.monotonic()
+            try:
+                next_t = time.monotonic()
+                pushed = 0
+                for f in frames:
+                    if self._stop.is_set() or gen != self._gen:
+                        break  # barged mid-sentence — stop at 20 ms granularity
+                    conn.push_audio_encoded_data(f, frame_info)
+                    pushed += 1
+                    next_t += 0.02
+                    delay = next_t - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                self._last_push = time.monotonic()
+            except Exception as e:
+                self.log(f"[orch] publisher error: {e}")
 
     def _tts(self, text):
         try:
