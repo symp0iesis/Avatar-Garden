@@ -229,3 +229,111 @@ class G722Encoder:
             out[out_pos] = (ihigh << 6) | ilow
             out_pos += 1
         return bytes(out)
+
+# ============================ decoder ============================
+# Port of g722_decode.c (SpanDSP/Asterisk reference) — 64 kbit/s only,
+# unpacked octets (one byte per output sample pair).
+
+QM6 = (-136, -136, -136, -136,
+       -24808, -21904, -19008, -16704,
+       -14984, -13512, -12280, -11192,
+       -10232, -9360, -8576, -7856,
+       -7192, -6576, -6000, -5456,
+       -4944, -4464, -4008, -3576,
+       -3168, -2776, -2400, -2032,
+       -1688, -1360, -1040, -728,
+       24808, 21904, 19008, 16704,
+       14984, 13512, 12280, 11192,
+       10232, 9360, 8576, 7856,
+       7192, 6576, 6000, 5456,
+       4944, 4464, 4008, 3576,
+       3168, 2776, 2400, 2032,
+       1688, 1360, 1040, 728,
+       432, 136, -432, -136)
+
+
+class G722Decoder:
+    """64 kbit/s G.722 decoder: octet stream in, 16 kHz s16 PCM out."""
+
+    def __init__(self):
+        self.x = [0] * 24          # receive QMF delay line
+        self.b0 = _Band(32)        # low sub-band
+        self.b1 = _Band(8)         # high sub-band
+
+    def decode(self, data):
+        """data: G.722 octets (1 byte = 2 output samples). Returns list[int16]."""
+        amp = []
+        x = self.x
+        b0, b1 = self.b0, self.b1
+        qc = QMF_COEFFS
+        for code in data:
+            wd1 = code & 0x3F
+            ihigh = (code >> 6) & 0x03
+            wd2 = QM6[wd1]
+            wd1 >>= 2
+
+            # --- Block 5L/6L: low band reconstruct + limit ---
+            wd2 = (b0.det * wd2) >> 15
+            rlow = b0.s + wd2
+            if rlow > 16383:
+                rlow = 16383
+            elif rlow < -16384:
+                rlow = -16384
+            # --- Block 2L, INVQAL ---
+            wd2 = QM4[wd1]
+            dlowt = (b0.det * wd2) >> 15
+            # --- Block 3L, LOGSCL ---
+            wd2 = RL42[wd1]
+            wd1 = (b0.nb * 127) >> 7
+            wd1 += WL[wd2]
+            if wd1 < 0:
+                wd1 = 0
+            elif wd1 > 18432:
+                wd1 = 18432
+            b0.nb = wd1
+            # --- Block 3L, SCALEL ---
+            wd1 = (b0.nb >> 6) & 31
+            wd2 = 8 - (b0.nb >> 11)
+            wd3 = (ILB[wd1] << -wd2) if wd2 < 0 else (ILB[wd1] >> wd2)
+            b0.det = wd3 << 2
+            _block4(b0, dlowt)
+
+            # --- high band ---
+            wd2 = QM2[ihigh]
+            dhigh = (b1.det * wd2) >> 15
+            rhigh = dhigh + b1.s
+            if rhigh > 16383:
+                rhigh = 16383
+            elif rhigh < -16384:
+                rhigh = -16384
+            wd2 = RH2[ihigh]
+            wd1 = (b1.nb * 127) >> 7
+            wd1 += WH[wd2]
+            if wd1 < 0:
+                wd1 = 0
+            elif wd1 > 22528:
+                wd1 = 22528
+            b1.nb = wd1
+            wd1 = (b1.nb >> 6) & 31
+            wd2 = 10 - (b1.nb >> 11)
+            wd3 = (ILB[wd1] << -wd2) if wd2 < 0 else (ILB[wd1] >> wd2)
+            b1.det = wd3 << 2
+            _block4(b1, dhigh)
+
+            # --- receive QMF ---
+            x[0] = x[2]; x[1] = x[3]; x[2] = x[4]; x[3] = x[5]
+            x[4] = x[6]; x[5] = x[7]; x[6] = x[8]; x[7] = x[9]
+            x[8] = x[10]; x[9] = x[11]; x[10] = x[12]; x[11] = x[13]
+            x[12] = x[14]; x[13] = x[15]; x[14] = x[16]; x[15] = x[17]
+            x[16] = x[18]; x[17] = x[19]; x[18] = x[20]; x[19] = x[21]
+            x[20] = x[22]; x[21] = x[23]
+            x[22] = rlow + rhigh
+            x[23] = rlow - rhigh
+            xout1 = 0
+            xout2 = 0
+            for i in range(12):
+                xout2 += x[2 * i] * qc[i]
+                xout1 += x[2 * i + 1] * qc[11 - i]
+            amp.append(_saturate(xout1 >> 11))
+            amp.append(_saturate(xout2 >> 11))
+        return amp
