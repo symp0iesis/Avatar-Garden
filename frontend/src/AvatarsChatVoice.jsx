@@ -171,6 +171,7 @@ export default function AvatarsChatVoice() {
 
     const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     audioCtxRef.current = ctx;
+    if (ctx.state === "suspended") await ctx.resume();  // without this the mic capture never fires
     playNextRef.current = 0;
 
     let speakTimer = null;
