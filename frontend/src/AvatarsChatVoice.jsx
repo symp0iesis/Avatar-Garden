@@ -169,10 +169,16 @@ export default function AvatarsChatVoice() {
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
-    // Native-rate context: Chromium delivers SILENCE from MediaStreamSource
-    // when the context rate differs from the mic's native rate. The client
-    // declares its ctx rate in the init frame; Deepgram connects at it.
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    // Mic FIRST: Chromium delivers SILENCE from MediaStreamSource when the
+    // context rate differs from the INPUT device's rate (headsets often run
+    // 44.1k while the output runs 48k). Create the context at the mic's own
+    // reported rate after the stream exists.
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    micStreamRef.current = micStream;
+    const micRate = micStream.getAudioTracks()[0].getSettings().sampleRate || 48000;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: micRate });
     audioCtxRef.current = ctx;
     if (ctx.state === "suspended") await ctx.resume();
     playNextRef.current = 0;
@@ -211,11 +217,7 @@ export default function AvatarsChatVoice() {
     });
 
     // mic capture -> int16 PCM -> ws
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-    micStreamRef.current = stream;
-    const micSource = ctx.createMediaStreamSource(stream);
+    const micSource = ctx.createMediaStreamSource(micStream);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 512;
     analyserRef.current = analyser;
