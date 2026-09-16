@@ -1621,7 +1621,7 @@ def avatar_detail(avatar_id):
     # voiceBackend/voiceTransport live in llmDefaults (capability flags)
     if data.get("voiceBackend"):
         avatar.setdefault("llmDefaults", {})["voiceBackend"] = str(data["voiceBackend"]).lower()
-    if data.get("voiceTransport"):
+    if data.get("voiceTransport") in ("agora", "rtp", "ws"):
         avatar.setdefault("llmDefaults", {})["voiceTransport"] = str(data["voiceTransport"]).lower()
 
     # Handle ragLanguages separately (comma-separated string to list)
@@ -2116,6 +2116,9 @@ def start_voice_agent():
         is_device = isinstance(agent_parameters, dict) and bool(agent_parameters)
         full_duplex = not is_device
         voice_transport = str(llm_d.get("voiceTransport", "agora")).lower()
+        if voice_transport == "ws":
+            return _start_orchestrator_session(avatar_id, channel, True,
+                                              codec="pcm", transport="ws")
         transport = "rtp" if (is_device and voice_transport == "rtp") else "agora"
         return _start_orchestrator_session(avatar_id, channel, full_duplex,
                                           codec=("opus" if full_duplex else "g722"),
@@ -2271,6 +2274,8 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
                   f"(pid {existing['pid']}) — adopt")
             resp = {"agentId": existing["agent_id"], "channel": channel,
                     "transport": existing.get("transport", "agora")}
+            if resp["transport"] == "ws":
+                resp["wsPath"] = "/voice-ws"
             if "rtp_port" in existing:
                 from urllib.parse import urlparse
                 host = urlparse(os.environ.get("BACKEND_PUBLIC_URL", "")).hostname
@@ -2287,17 +2292,29 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
            "--idle", "180", "--max", "1800"]
     if full_duplex:
         cmd.append("--full-duplex")
-    cmd += ["--codec", codec]
+    if codec in ("g722", "opus"):
+        cmd += ["--codec", codec]  # ws mode takes no codec (raw PCM)
     rtp_port = None
     if transport == "rtp":
         rtp_port = _alloc_rtp_port()
         cmd += ["--rtp-port", str(rtp_port)]
+    if transport == "ws":
+        for s in list(_orch_sessions.values()):
+            if s.get("transport") == "ws":
+                try:
+                    os.kill(s["pid"], 0)
+                    return jsonify({"error": "another WebSocket voice session is live",
+                                    "agentId": s["agent_id"], "channel": "ws"}), 409
+                except OSError:
+                    pass
+        cmd += ["--ws-port", "8010"]
     proc = subprocess.Popen(
         cmd, cwd=ORCH_DIR, stdout=log_f, stderr=subprocess.STDOUT,
         start_new_session=True)
     agent_id = f"vps-{proc.pid}"
     entry = {"pid": proc.pid, "agent_id": agent_id,
-             "avatar_id": avatar_id, "started": time.time()}
+             "avatar_id": avatar_id, "started": time.time(),
+             "transport": transport}
     if rtp_port:
         entry["rtp_port"] = rtp_port
     _orch_sessions[channel] = entry
@@ -2310,6 +2327,8 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
         resp["rtpHost"] = socket.gethostbyname(host) if host else "127.0.0.1"
         resp["rtpPort"] = rtp_port
         resp["deviceUid"] = device_uid
+    if transport == "ws":
+        resp["wsPath"] = "/voice-ws"
     return jsonify(resp)
 
 

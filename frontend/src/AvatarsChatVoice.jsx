@@ -135,6 +135,111 @@ export default function AvatarsChatVoice() {
     setStatus("idle");
   }, [agentId, stopVolumePolling]);
 
+  const disconnectWs = async () => {
+    setIsDisconnecting(true);
+    try { wsRef.current?.close(); } catch (_e) {}
+    wsRef.current = null;
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    micStreamRef.current = null;
+    if (audioCtxRef.current) { try { await audioCtxRef.current.close(); } catch (_e) {} }
+    audioCtxRef.current = null;
+    setUserVolume(0); setAvatarVolume(0);
+    setIsConnected(false); setIsWs(false);
+    setIsDisconnecting(false); setStatus("idle");
+    await fetch("/api/voice/agent/stop", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: startRef.current }),
+    }).catch(() => {});
+    startRef.current = null;
+  };
+
+  const connectWs = async (start) => {
+    setIsWs(true);
+    startRef.current = start.agentId;
+    setStatus("connecting");
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(proto + "//" + location.host + start.wsPath);
+    ws.binaryType = "arraybuffer";
+    wsRef.current = ws;
+
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    audioCtxRef.current = ctx;
+    playNextRef.current = 0;
+
+    let speakTimer = null;
+    ws.onmessage = (e) => {
+      if (!(e.data instanceof ArrayBuffer)) return;
+      const pcm = new Int16Array(e.data);
+      if (!pcm.length) return;
+      setStatus("speaking");
+      // RMS for the avatar orb
+      let peak = 0;
+      for (let i = 0; i < pcm.length; i += 16) peak = Math.max(peak, Math.abs(pcm[i]));
+      setAvatarVolume(peak / 32768);
+      // schedule playback (continuous stream)
+      const buf = ctx.createBuffer(1, pcm.length, 16000);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+      const srcNode = ctx.createBufferSource();
+      srcNode.buffer = buf;
+      srcNode.connect(ctx.destination);
+      const now = ctx.currentTime;
+      if (playNextRef.current < now + 0.05) playNextRef.current = now + 0.05;
+      srcNode.start(playNextRef.current);
+      playNextRef.current += buf.duration;
+      if (speakTimer) clearTimeout(speakTimer);
+      speakTimer = setTimeout(() => {
+        setAvatarVolume(0);
+        setStatus("listening");
+      }, 600);
+    };
+    ws.onerror = (e) => { console.error("ws error", e); setError("WebSocket error"); setStatus("error"); };
+    await new Promise((res, rej) => {
+      ws.onopen = res;
+      ws.onclose = () => rej(new Error("voice websocket closed"));
+    });
+
+    // mic capture -> int16 PCM -> ws
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    micStreamRef.current = stream;
+    const micSource = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyserRef.current = analyser;
+    micSource.connect(analyser);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    const mute = ctx.createGain();
+    mute.gain.value = 0;  // mic must not reach output (AEC handles real echo)
+    proc.onaudioprocess = (e) => {
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+      const f = e.inputBuffer.getChannelData(0);
+      const int16 = new Int16Array(f.length);
+      for (let i = 0; i < f.length; i++) {
+        int16[i] = Math.max(-32768, Math.min(32767, Math.round(f[i] * 32767)));
+      }
+      wsRef.current.send(int16.buffer);
+    };
+    proc.connect(mute);
+    mute.connect(ctx.destination);
+
+    // user orb volume from the analyser
+    const volData = new Uint8Array(analyser.frequencyBinCount);
+    const poll = () => {
+      if (!analyserRef.current) return;
+      analyser.getByteTimeDomainData(volData);
+      let peak = 0;
+      for (let i = 0; i < volData.length; i++) peak = Math.max(peak, Math.abs(volData[i] - 128));
+      setUserVolume(peak / 128);
+      requestAnimationFrame(poll);
+    };
+    poll();
+
+    setIsConnected(true);
+    setStatus("listening");
+  };
+
   const connect = async () => {
     if (!selectedAvatarId || status === "connecting") return;
     setError(null);
@@ -142,7 +247,27 @@ export default function AvatarsChatVoice() {
     avatarIdRef.current = selectedAvatarId;
 
     try {
-      // 1. Get Agora credentials from backend
+      // 0. Ask the backend to spawn the voice session (response selects transport)
+      const startResp = await fetch("/api/voice/agent/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          avatarId: selectedAvatarId,
+          channel: channelRef.current,
+          userUid: uid || 0,
+          streaming: streamingEnabled,
+        }),
+      });
+      if (!startResp.ok) {
+        const err = await startResp.json();
+        throw new Error(typeof err.error === "string" ? err.error : JSON.stringify(err.error));
+      }
+      const start = await startResp.json();
+
+      if (start.transport === "ws") {
+        return await connectWs(start);
+      }
+      // else: fall through to the Agora path with the session already spawned
       const tokenResp = await fetch(`/api/voice/token?channel=${channelRef.current}`);
       const { appId, token, channel, uid } = await tokenResp.json();
 
@@ -473,7 +598,7 @@ export default function AvatarsChatVoice() {
         </Button>
       ) : (
         <Button
-          onClick={() => disconnect()}
+          onClick={() => (isWs ? disconnectWs() : disconnect())}
           disabled={isDisconnecting}
           className="bg-garden-clay hover:bg-garden-clay/80 text-garden-paper rounded-md px-8 py-3 text-base font-poetic disabled:opacity-60"
         >

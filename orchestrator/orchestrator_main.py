@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--max", type=int, default=600)
     ap.add_argument("--codec", default="g722", choices=["g722", "opus"])
     ap.add_argument("--rtp-port", type=int, default=0, help="UDP listen port (rtp transport)")
+    ap.add_argument("--ws-port", type=int, default=0, help="WS listen port (ws transport)")
     ap.add_argument("--full-duplex", action="store_true",
                     help="web client (browser AEC): keep uplink during downlink, allow barge-in")
     args = ap.parse_args()
@@ -58,7 +59,8 @@ def main():
         cartesia_key=env["CARTESIA_API_KEY"],
         tts_voice_id=av.get("ttsVoiceId") or "default",
         full_duplex=args.full_duplex, codec=args.codec,
-        transport=("rtp" if args.rtp_port else "agora"), rtp_port=args.rtp_port)
+        transport=("ws" if args.ws_port else ("rtp" if args.rtp_port else "agora")),
+        rtp_port=args.rtp_port, ws_port=args.ws_port)
     s.run(idle_timeout_s=args.idle, max_duration_s=args.max)
     return 0
 

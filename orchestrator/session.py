@@ -62,7 +62,7 @@ class VoiceSession:
                  deepgram_key, cartesia_key, tts_voice_id,
                  backend_base="http://127.0.0.1:5001",
                  language="multi", full_duplex=False, codec="g722", transport="agora",
-                 rtp_port=26000, log=print):
+                 rtp_port=26000, ws_port=8010, log=print):
         self.avatar_id = str(avatar_id)
         self.channel = channel
         self.token = token
@@ -76,6 +76,8 @@ class VoiceSession:
         self.codec = codec               # "g722" (device) | "opus" (web)
         self.transport = transport       # "agora" (SDK) | "rtp" (UDP direct)
         self.rtp_port = rtp_port         # VPS listen port (rtp mode)
+        self.ws_port = ws_port           # VPS listen port (ws mode)
+        self._ws_clients = set()         # live websocket clients
         self._device_addr = None         # learned from first received packet
         self._rtp_stats = {"pkts": 0, "samples": 0}
         self.log = log
@@ -170,7 +172,7 @@ class VoiceSession:
             if pcm and gen == self._gen:
                 self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
                          f"({len(pcm) // 32000:.1f}s audio)")
-            if self.transport == "rtp" and pcm and gen == self._gen:
+            if self.transport in ("rtp", "ws") and pcm and gen == self._gen:
                 chunks = [pcm[i:i + 640] for i in range(0, len(pcm) - 639, 640)]
                 if len(pcm) % 640:
                     chunks.append(pcm[-(len(pcm) % 640):].ljust(640, b"\x00"))
@@ -471,6 +473,9 @@ class VoiceSession:
         if self.transport == "rtp":
             self._run_rtp(idle_timeout_s=idle_timeout_s, max_duration_s=max_duration_s)
             return
+        if self.transport == "ws":
+            self._run_ws(idle_timeout_s=idle_timeout_s, max_duration_s=max_duration_s)
+            return
         self._sdk_ready = threading.Event()
         t_sdk = threading.Thread(target=self._sdk_thread, daemon=True)
         t_sdk.start()
@@ -515,3 +520,115 @@ class VoiceSession:
         self._stop.set()
         t_sdk.join(timeout=10)
         self.log("[orch] session ended")
+
+# --- appended: WS transport methods (kept as module-level patch for review) ---
+
+def _ws_patch(cls):
+    """Attach WS transport methods to VoiceSession (Fase 6: web + device)."""
+    def _run_ws(self, idle_timeout_s, max_duration_s):
+        """WebSocket transport: binary frames = PCM s16le 16 kHz, both ways."""
+        import asyncio
+        import websockets
+        self._stop_publish = threading.Event()
+        self._ws_loop = asyncio.new_event_loop()
+        t_loop = threading.Thread(
+            target=lambda: (asyncio.set_event_loop(self._ws_loop),
+                            self._ws_loop.run_forever()), daemon=True)
+        t_loop.start()
+
+        streamer = DeepgramStreamer(
+            self.dg_key, language=self.language,
+            on_interim=lambda t: setattr(self, "_last_activity", time.monotonic()),
+            on_utterance=self._on_utterance)
+
+        async def ws_handler(ws):
+            self._ws_clients.add(ws)
+            self.log(f"[ws] client connected ({len(self._ws_clients)} live)")
+            try:
+                async for msg in ws:
+                    if not isinstance(msg, (bytes, bytearray)):
+                        continue
+                    if not self.full_duplex and self._muted.is_set():
+                        continue
+                    self._last_activity = max(self._last_activity, time.monotonic())
+                    await streamer.send_audio(bytes(msg))
+            except websockets.ConnectionClosed:
+                pass
+            except Exception as e:
+                self.log(f"[ws] handler error: {e}")
+            finally:
+                self._ws_clients.discard(ws)
+                self.log(f"[ws] client disconnected ({len(self._ws_clients)} live)")
+
+        async def _start():
+            self._ws_server = await websockets.serve(
+                ws_handler, "0.0.0.0", self.ws_port, max_size=None)
+            await streamer.connect()
+        asyncio.run_coroutine_threadsafe(_start(), self._ws_loop).result(20)
+
+        t_tts = threading.Thread(target=self._tts_worker, daemon=True)
+        t_tts.start()
+        t_pub = threading.Thread(target=self._ws_publisher, daemon=True)
+        t_pub.start()
+
+        self.log(f"[orch] live (ws): avatar={self.avatar_id} channel={self.channel} "
+                 f"mode={'full-duplex' if self.full_duplex else 'half-duplex'} "
+                 f"codec=pcm idle={idle_timeout_s}s")
+        t_start = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if max_duration_s and now - t_start > max_duration_s:
+                self.log("[ws] max duration reached — ending session")
+                break
+            if (not self._turn_active and now - self._last_activity > idle_timeout_s
+                    and not self._speaking()):
+                self.log("[ws] auto-idle — ending session")
+                break
+            time.sleep(0.2)
+
+        async def _stop_all():
+            self._ws_server.close()
+            await self._ws_server.wait_closed()
+            await streamer.close()
+        asyncio.run_coroutine_threadsafe(_stop_all(), self._ws_loop).result(15)
+        self._ws_loop.call_soon_threadsafe(self._ws_loop.stop)
+        self._stop_publish.set()
+        self.log("[ws] session ended")
+
+    def _ws_publisher(self):
+        """TTS PCM chunks -> binary frames broadcast to ws clients."""
+        while not self._stop_publish.is_set():
+            try:
+                gen, chunks = self._pcm_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if gen != self._gen:
+                continue
+            try:
+                self._push_busy = True
+                pcm = b"".join(chunks)
+                pcm = pcm[:len(pcm) - len(pcm) % 2]
+                if pcm:
+                    asyncio.run_coroutine_threadsafe(
+                        self._ws_broadcast(pcm), self._ws_loop)
+                self._last_push = time.monotonic()
+            except Exception as e:
+                self.log(f"[ws] publisher error: {e}")
+            finally:
+                self._push_busy = False
+
+    async def _ws_broadcast(self, pcm):
+        if not self._ws_clients:
+            return
+        import asyncio
+        clients = [c for c in list(self._ws_clients) if c.state.name == "OPEN"]
+        if clients:
+            await asyncio.gather(*[c.send(pcm) for c in clients],
+                                 return_exceptions=True)
+
+    cls._run_ws = _run_ws
+    cls._ws_publisher = _ws_publisher
+    cls._ws_broadcast = _ws_broadcast
+
+
+_ws_patch(VoiceSession)
