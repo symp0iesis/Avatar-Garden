@@ -170,6 +170,12 @@ class VoiceSession:
             if pcm and gen == self._gen:
                 self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
                          f"({len(pcm) // 32000:.1f}s audio)")
+            if self.transport == "rtp" and pcm and gen == self._gen:
+                chunks = [pcm[i:i + 640] for i in range(0, len(pcm) - 639, 640)]
+                if len(pcm) % 640:
+                    chunks.append(pcm[-(len(pcm) % 640):].ljust(640, b"\x00"))
+                self._pcm_q.put((gen, chunks))
+                continue
                 if len(pcm) % (2 * 320):
                     pcm += b"\x00" * (640 - len(pcm) % 640)
                 samples = array.array("h")
@@ -390,15 +396,19 @@ class VoiceSession:
                 continue
             self._last_activity = max(self._last_activity, time.monotonic())
             payload = self._rtp_payload(pkt)
-            pcm = self._g722_dec.decode(payload)
+            pt = pkt[1] & 0x7F
+            if pt == 96:
+                pcm = self._g722_dec.decode(payload)
+                audio = struct.pack("<%dh" % len(pcm), *pcm)
+            else:
+                audio = payload  # PT 97: raw s16le PCM
             self._rtp_stats["pkts"] += 1
-            self._rtp_stats["samples"] += len(pcm)
+            self._rtp_stats["samples"] += len(audio)
             if self._rtp_stats["pkts"] % 50 == 0:
                 self.log(f"[rtp] rx {self._rtp_stats['pkts']} pkts, "
                          f"{self._rtp_stats['samples']} samples decoded, "
                          f"last payload {len(payload)} B")
-            asyncio.run_coroutine_threadsafe(streamer.send_audio(
-                struct.pack("<%dh" % len(pcm), *pcm)), loop)
+            asyncio.run_coroutine_threadsafe(streamer.send_audio(audio), loop)
 
         asyncio.run_coroutine_threadsafe(streamer.close(), loop).result(10)
         loop.call_soon_threadsafe(loop.stop)
@@ -454,7 +464,7 @@ class VoiceSession:
     def _rtp_packet(self, payload, seq, ts):
         """12-byte RTP header (incl. SSRC), PT 96 (dynamic G722), no CSRC."""
         b0 = 0x80  # version 2, no padding, no extension, cc=0
-        return struct.pack("!BBHII", b0, 96, seq & 0xFFFF, ts, 0x77700001) + payload
+        return struct.pack("!BBHII", b0, 97, seq & 0xFFFF, ts, 0x77700001) + payload  # PT 97 = PCM
 
     # ------------------------- session loop -------------------------
     def run(self, idle_timeout_s=IDLE_TIMEOUT_S, max_duration_s=MAX_DURATION_S):

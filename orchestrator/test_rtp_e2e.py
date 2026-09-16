@@ -22,7 +22,7 @@ import wave
 
 import requests
 
-from g722 import G722Encoder, G722Decoder
+from g722 import G722Decoder
 
 RATE = 16000
 FRAME_SAMPLES = 320
@@ -76,7 +76,6 @@ def main():
     question_pcm = q.content
     print(f"[fake] question: {len(question_pcm)/32000:.1f}s of speech")
 
-    enc = G722Encoder()
     dec = G722Decoder()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(0.05)
@@ -89,9 +88,8 @@ def main():
     def send_pcm(pcm):
         nonlocal seq, ts
         for k in range(0, len(pcm) - 639, 640):
-            samples = struct.unpack("<320h", pcm[k:k + 640])
-            pkt = struct.pack("!BBHII", 0x80, 96, seq & 0xFFFF, ts, 0x1) + \
-                  enc.encode(samples)
+            pkt = struct.pack("!BBHII", 0x80, 97, seq & 0xFFFF, ts, 0x1) + \
+                  pcm[k:k + 640]
             seq = (seq + 1) & 0xFFFF
             ts = (ts + 320) & 0xFFFFFFFF
             sock.sendto(pkt, (args.host, args.port))
@@ -116,7 +114,11 @@ def main():
             except socket.timeout:
                 break
             payload = pkt[12:] if (pkt[0] >> 6) == 2 else pkt
-            downlink += dec.decode(payload)
+            pt = pkt[1] & 0x7F if (pkt[0] >> 6) == 2 else 97
+            if pt == 96:
+                downlink += dec.decode(payload)   # G722 payload
+            else:
+                downlink += struct.unpack("<%dh" % (len(payload) // 2), payload[:len(payload)//2*2])  # PCM
         if len(downlink) != down_n:
             down_n = len(downlink)
             t_last = time.monotonic()
