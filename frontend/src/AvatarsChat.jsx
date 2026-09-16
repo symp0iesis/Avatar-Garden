@@ -1208,8 +1208,7 @@ export default function MultiAvatarChat() {
                         </select>
                     </div>
                   )}
-              </div>
-              </div>
+                   </div>
 
               {/* Voice (Cartesia TTS) — per-avatar voice + synthesis language */}
               <div className="p-3 rounded-lg border bg-garden-paper2">
