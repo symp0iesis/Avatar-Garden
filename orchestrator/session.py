@@ -565,7 +565,7 @@ def _ws_patch(cls):
                     try:
                         if not self.full_duplex and self._muted.is_set():
                             continue
-                        await streamer.send_audio(bytes(msg))
+                        await client_streamer.send_audio(bytes(msg))
                     except Exception as e:
                         self.log(f"[ws] send_audio failed: {e}")
             except websockets.ConnectionClosed:
