@@ -543,11 +543,26 @@ def _ws_patch(cls):
                 msg_n = 0
                 cap = bytearray()
                 cap_max = RATE * 2 * 60   # up to 60 s of uplink saved for diagnosis
+                client_streamer = None    # created on the client's init frame
                 async for msg in ws:
                     msg_n += 1
                     if msg_n <= 5 or msg_n % 50 == 0:
                         self.log(f"[ws] rx frame {msg_n}: {len(msg)} B "
                                  f"({'binary' if isinstance(msg, (bytes, bytearray)) else type(msg).__name__})")
+                    if not isinstance(msg, (bytes, bytearray)):
+                        # init frame: the client declares its capture rate
+                        try:
+                            d = json.loads(msg)
+                            rate = int(d.get("sampleRate", 16000))
+                        except Exception:
+                            rate = 16000
+                        client_streamer = DeepgramStreamer(
+                            self.dg_key, language=self.language, sample_rate=rate,
+                            on_interim=lambda t: setattr(self, "_last_activity", time.monotonic()),
+                            on_utterance=self._on_utterance)
+                        await client_streamer.connect()
+                        self.log(f"[ws] client init: deepgram connected at {rate} Hz")
+                        continue
                     if isinstance(msg, (bytes, bytearray)) and len(cap) < cap_max:
                         cap += bytes(msg[:cap_max - len(cap)])
                         if len(cap) >= cap_max:
