@@ -536,22 +536,38 @@ def _ws_patch(cls):
                             self._ws_loop.run_forever()), daemon=True)
         t_loop.start()
 
-        streamer = DeepgramStreamer(
-            self.dg_key, language=self.language,
-            on_interim=lambda t: setattr(self, "_last_activity", time.monotonic()),
-            on_utterance=self._on_utterance)
-
         async def ws_handler(ws):
             self._ws_clients.add(ws)
             self.log(f"[ws] client connected ({len(self._ws_clients)} live)")
             try:
+                msg_n = 0
+                cap = bytearray()
+                cap_max = RATE * 2 * 60   # up to 60 s of uplink saved for diagnosis
                 async for msg in ws:
+                    msg_n += 1
+                    if msg_n <= 5 or msg_n % 50 == 0:
+                        self.log(f"[ws] rx frame {msg_n}: {len(msg)} B "
+                                 f"({'binary' if isinstance(msg, (bytes, bytearray)) else type(msg).__name__})")
+                    if isinstance(msg, (bytes, bytearray)) and len(cap) < cap_max:
+                        cap += bytes(msg[:cap_max - len(cap)])
+                        if len(cap) >= cap_max:
+                            try:
+                                wave_out = "/tmp/uplink_ws_diag.wav"
+                                import wave as _w
+                                with _w.open(wave_out, "wb") as _f:
+                                    _f.setnchannels(1); _f.setsampwidth(2); _f.setframerate(RATE)
+                                    _f.writeframes(bytes(cap))
+                                self.log(f"[ws] uplink sample saved: {wave_out}")
+                            except Exception as e:
+                                self.log(f"[ws] save failed: {e}")
                     if not isinstance(msg, (bytes, bytearray)):
                         continue
-                    if not self.full_duplex and self._muted.is_set():
-                        continue
-                    self._last_activity = max(self._last_activity, time.monotonic())
-                    await streamer.send_audio(bytes(msg))
+                    try:
+                        if not self.full_duplex and self._muted.is_set():
+                            continue
+                        await streamer.send_audio(bytes(msg))
+                    except Exception as e:
+                        self.log(f"[ws] send_audio failed: {e}")
             except websockets.ConnectionClosed:
                 pass
             except Exception as e:
@@ -563,7 +579,6 @@ def _ws_patch(cls):
         async def _start():
             self._ws_server = await websockets.serve(
                 ws_handler, "0.0.0.0", self.ws_port, max_size=None)
-            await streamer.connect()
         asyncio.run_coroutine_threadsafe(_start(), self._ws_loop).result(20)
 
         t_tts = threading.Thread(target=self._tts_worker, daemon=True)
@@ -589,7 +604,6 @@ def _ws_patch(cls):
         async def _stop_all():
             self._ws_server.close()
             await self._ws_server.wait_closed()
-            await streamer.close()
         asyncio.run_coroutine_threadsafe(_stop_all(), self._ws_loop).result(15)
         self._ws_loop.call_soon_threadsafe(self._ws_loop.stop)
         self._stop_publish.set()

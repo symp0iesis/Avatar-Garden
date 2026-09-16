@@ -170,8 +170,8 @@ export default function AvatarsChatVoice() {
     wsRef.current = ws;
 
     // Native-rate context: Chromium delivers SILENCE from MediaStreamSource
-    // when the context rate differs from the mic's native rate. We capture
-    // at 48 kHz and downsample 3:1 to 16 kHz in the processor.
+    // when the context rate differs from the mic's native rate. The client
+    // declares its ctx rate in the init frame; Deepgram connects at it.
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     audioCtxRef.current = ctx;
     if (ctx.state === "suspended") await ctx.resume();
@@ -223,15 +223,14 @@ export default function AvatarsChatVoice() {
     const proc = ctx.createScriptProcessor(4096, 1, 1);
     const mute = ctx.createGain();
     mute.gain.value = 0;  // mic must not reach output (AEC handles real echo)
+    // declare the capture rate once — the server connects Deepgram at it
+    ws.send(JSON.stringify({ type: "init", sampleRate: ctx.sampleRate }));
     proc.onaudioprocess = (e) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
       const f = e.inputBuffer.getChannelData(0);
-      // 3:1 downsample (48k native -> 16k) with 3-tap averaging
-      const n = Math.floor(f.length / 3);
-      const int16 = new Int16Array(n);
-      for (let i = 0; i < n; i++) {
-        const v = (f[i * 3] + f[i * 3 + 1] + f[i * 3 + 2]) / 3;
-        int16[i] = Math.max(-32768, Math.min(32767, Math.round(v * 32767)));
+      const int16 = new Int16Array(f.length);
+      for (let i = 0; i < f.length; i++) {
+        int16[i] = Math.max(-32768, Math.min(32767, Math.round(f[i] * 32767)));
       }
       wsRef.current.send(int16.buffer);
     };
