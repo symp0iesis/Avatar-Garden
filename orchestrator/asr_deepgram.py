@@ -43,12 +43,13 @@ DEFAULT_PARAMS = {
 class DeepgramStreamer:
     def __init__(self, api_key, on_utterance=None, on_interim=None,
                  language="multi", keyterms=None, endpointing_ms=500,
-                 utterance_end_ms=1000):
+                 utterance_end_ms=1000, sample_rate=16000):
         self._key = api_key
         self._on_utterance = on_utterance
         self._on_interim = on_interim
         params = dict(DEFAULT_PARAMS)
         params["language"] = language
+        params["sample_rate"] = str(sample_rate)
         params["endpointing"] = str(endpointing_ms)
         params["utterance_end_ms"] = str(utterance_end_ms)
         query = "&".join(f"{k}={v}" for k, v in params.items())
