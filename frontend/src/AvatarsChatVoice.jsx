@@ -35,6 +35,13 @@ export default function AvatarsChatVoice() {
 
   const clientRef = useRef(null);
   const micTrackRef = useRef(null);
+  const wsRef = useRef(null);            // VPS ws voice (Fase 6)
+  const audioCtxRef = useRef(null);
+  const playNextRef = useRef(0);
+  const analyserRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const startRef = useRef(null);
+  const [isWs, setIsWs] = useState(false);
   const volumeRafRef = useRef(null);
   // Unique channel per session so multiple browser tabs don't collide
   const channelRef = useRef(`avatar-lab-${Date.now()}`);
@@ -391,7 +398,10 @@ export default function AvatarsChatVoice() {
   const disconnectRef = useRef(disconnect);
   disconnectRef.current = disconnect;
   useEffect(() => {
-    return () => { disconnectRef.current(true); };
+    return () => {
+        if (isWs) { try { wsRef.current?.close(); } catch (_e) {} }
+        disconnectRef.current(true);
+      };
   }, []);
 
   const userRippleScale = 1 + userVolume * 2;
