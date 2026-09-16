@@ -2400,6 +2400,24 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
         resp["deviceUid"] = device_uid
     if transport == "ws":
         resp["wsPath"] = "/voice-ws"
+        # wait for a FULL WebSocket handshake on 8010 — TCP-listening is not
+        # enough (the browser connected to a bound port and got closed)
+        import time as _t
+        import asyncio as _a
+        import websockets as _wsmod
+        _deadline = _t.time() + 12
+        _ready = False
+        while _t.time() < _deadline and not _ready:
+            async def _probe():
+                c = await _wsmod.connect("ws://127.0.0.1:8010", open_timeout=2)
+                await c.close()
+            try:
+                _a.run(_probe())
+                _ready = True
+            except Exception:
+                _t.sleep(0.5)
+        if not _ready:
+            print("[Voice] ws port 8010 not accepting within 12s")
     return jsonify(resp)
 
 
