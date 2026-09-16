@@ -169,9 +169,12 @@ export default function AvatarsChatVoice() {
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
-    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    // Native-rate context: Chromium delivers SILENCE from MediaStreamSource
+    // when the context rate differs from the mic's native rate. We capture
+    // at 48 kHz and downsample 3:1 to 16 kHz in the processor.
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
     audioCtxRef.current = ctx;
-    if (ctx.state === "suspended") await ctx.resume();  // without this the mic capture never fires
+    if (ctx.state === "suspended") await ctx.resume();
     playNextRef.current = 0;
 
     let speakTimer = null;
@@ -223,9 +226,12 @@ export default function AvatarsChatVoice() {
     proc.onaudioprocess = (e) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
       const f = e.inputBuffer.getChannelData(0);
-      const int16 = new Int16Array(f.length);
-      for (let i = 0; i < f.length; i++) {
-        int16[i] = Math.max(-32768, Math.min(32767, Math.round(f[i] * 32767)));
+      // 3:1 downsample (48k native -> 16k) with 3-tap averaging
+      const n = Math.floor(f.length / 3);
+      const int16 = new Int16Array(n);
+      for (let i = 0; i < n; i++) {
+        const v = (f[i * 3] + f[i * 3 + 1] + f[i * 3 + 2]) / 3;
+        int16[i] = Math.max(-32768, Math.min(32767, Math.round(v * 32767)));
       }
       wsRef.current.send(int16.buffer);
     };
