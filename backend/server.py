@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import socket
 import threading
 import signal
 import subprocess
@@ -1617,9 +1618,11 @@ def avatar_detail(avatar_id):
                   "ttsVoiceId", "ttsLanguage", "ragPinned", "keywordMode"]:
         if field in data and data[field] is not None:
             avatar[field] = data[field]
-    # voiceBackend lives in llmDefaults (capability flag next to webSearchEnabled)
+    # voiceBackend/voiceTransport live in llmDefaults (capability flags)
     if data.get("voiceBackend"):
         avatar.setdefault("llmDefaults", {})["voiceBackend"] = str(data["voiceBackend"]).lower()
+    if data.get("voiceTransport"):
+        avatar.setdefault("llmDefaults", {})["voiceTransport"] = str(data["voiceTransport"]).lower()
 
     # Handle ragLanguages separately (comma-separated string to list)
     if "ragLanguages" in data and data["ragLanguages"] is not None:
@@ -1729,8 +1732,9 @@ def avatar_llm_defaults(avatar_id):
     # missing a task's fields must not wipe that task (avatars.json lost
     # defaults twice on 2026-08-11 to partial/implicit saves; see ISSUES.md 13).
     llm_defaults = dict(avatar.get("llmDefaults", {}))
-    if "voiceBackend" in incoming:
-        llm_defaults["voiceBackend"] = incoming.pop("voiceBackend")
+    for k in ("voiceBackend", "voiceTransport"):
+        if k in incoming:
+            llm_defaults[k] = incoming.pop(k)
     for task, cfg in incoming.items():
         cfg = {k: v for k, v in cfg.items() if v is not None}
         if cfg.get("model") or cfg.get("provider"):
@@ -1961,6 +1965,7 @@ app.register_blueprint(llm_providers_bp)
 
 
 import re
+import socket
 
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 FLASK_WARN = 'WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.'
@@ -2102,13 +2107,20 @@ def start_voice_agent():
 
     voice_backend = str((avatar or {}).get("llmDefaults", {}).get(
         "voiceBackend", "convoai")).lower()
+    llm_d = (avatar or {}).get("llmDefaults", {})
     if voice_backend == "vps":
         # Web clients omit `parameters` (no output_audio_codec) — they have
-        # browser AEC, so full-duplex + barge-in is safe. Device clients send
-        # parameters — no AEC guarantee -> half-duplex gate.
-        full_duplex = not (isinstance(agent_parameters, dict) and agent_parameters)
+        # browser AEC, so full-duplex + barge-in is safe, and they always ride
+        # the Agora transport (browsers speak WebRTC, not raw RTP). Device
+        # clients send parameters — they honor the avatar's transport choice.
+        is_device = isinstance(agent_parameters, dict) and bool(agent_parameters)
+        full_duplex = not is_device
+        voice_transport = str(llm_d.get("voiceTransport", "agora")).lower()
+        transport = "rtp" if (is_device and voice_transport == "rtp") else "agora"
         return _start_orchestrator_session(avatar_id, channel, full_duplex,
-                                          codec=("opus" if full_duplex else "g722"))
+                                          codec=("opus" if full_duplex else "g722"),
+                                          transport=transport,
+                                          device_uid=user_uid)
 
     # Use avatar system prompt — trim sensor/function instructions (handled separately)
     system_prompt = avatar_llms[avatar_id].system_prompt
@@ -2226,10 +2238,30 @@ def start_voice_agent():
 ORCH_DIR = "/root/AvatarGarden/orchestrator"
 ORCH_PY = "/root/agora-orchestrator-venv/bin/python"
 ORCH_LOG_DIR = "/root/AvatarGarden/orchestrator/logs"
-_orch_sessions = {}  # channel -> {"pid", "agent_id", "avatar_id", "started"}
+_orch_sessions = {}  # channel -> {"pid", "agent_id", "avatar_id", "started", ...}
+ORCH_RTP_PORT_BASE = 26100
+ORCH_RTP_PORT_MAX = 26999
+
+def _alloc_rtp_port():
+    used = set()
+    for s in list(_orch_sessions.values()):
+        if "rtp_port" not in s:
+            continue
+        try:
+            os.kill(s["pid"], 0)   # still alive?
+            used.add(s["rtp_port"])
+        except OSError:
+            pass  # dead session — port reusable
+    p = ORCH_RTP_PORT_BASE
+    while p <= ORCH_RTP_PORT_MAX:
+        if p not in used:
+            return p
+        p += 1
+    raise RuntimeError("no free RTP ports")
 
 
-def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g722"):
+def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g722",
+                               transport="agora", device_uid=1):
     """Spawn a VoiceSession process for this channel; adopt an existing one."""
     existing = _orch_sessions.get(channel)
     if existing:
@@ -2237,7 +2269,15 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
             os.kill(existing["pid"], 0)
             print(f"[Voice] Orchestrator already live for {channel} "
                   f"(pid {existing['pid']}) — adopt")
-            return jsonify({"agentId": existing["agent_id"], "channel": channel})
+            resp = {"agentId": existing["agent_id"], "channel": channel,
+                    "transport": existing.get("transport", "agora")}
+            if "rtp_port" in existing:
+                from urllib.parse import urlparse
+                host = urlparse(os.environ.get("BACKEND_PUBLIC_URL", "")).hostname
+                resp.update({"rtpHost": socket.gethostbyname(host) if host else "127.0.0.1",
+                             "rtpPort": existing["rtp_port"],
+                             "deviceUid": existing.get("device_uid", 1)})
+            return jsonify(resp)
         except OSError:
             _orch_sessions.pop(channel, None)
     os.makedirs(ORCH_LOG_DIR, exist_ok=True)
@@ -2248,14 +2288,29 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
     if full_duplex:
         cmd.append("--full-duplex")
     cmd += ["--codec", codec]
+    rtp_port = None
+    if transport == "rtp":
+        rtp_port = _alloc_rtp_port()
+        cmd += ["--rtp-port", str(rtp_port)]
     proc = subprocess.Popen(
         cmd, cwd=ORCH_DIR, stdout=log_f, stderr=subprocess.STDOUT,
         start_new_session=True)
     agent_id = f"vps-{proc.pid}"
-    _orch_sessions[channel] = {"pid": proc.pid, "agent_id": agent_id,
-                               "avatar_id": avatar_id, "started": time.time()}
-    print(f"[Voice] VPS orchestrator started: channel={channel} pid={proc.pid}")
-    return jsonify({"agentId": agent_id, "channel": channel})
+    entry = {"pid": proc.pid, "agent_id": agent_id,
+             "avatar_id": avatar_id, "started": time.time()}
+    if rtp_port:
+        entry["rtp_port"] = rtp_port
+    _orch_sessions[channel] = entry
+    print(f"[Voice] VPS orchestrator started: channel={channel} pid={proc.pid} "
+          f"transport={transport}{' rtp_port=' + str(rtp_port) if rtp_port else ''}")
+    resp = {"agentId": agent_id, "channel": channel, "transport": transport}
+    if rtp_port:
+        from urllib.parse import urlparse
+        host = urlparse(os.environ.get("BACKEND_PUBLIC_URL", "")).hostname
+        resp["rtpHost"] = socket.gethostbyname(host) if host else "127.0.0.1"
+        resp["rtpPort"] = rtp_port
+        resp["deviceUid"] = device_uid
+    return jsonify(resp)
 
 
 @voice_bp.route("/api/voice/agent/stop", methods=["POST"])

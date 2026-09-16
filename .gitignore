@@ -43,3 +43,14 @@ backend/avatars_history/
 # Runtime logs (contain secret-printing traces; never track)
 backend_log.*
 *.log
+
+# Agora SDK runtime state (created in orchestrator/ by the SDK)
+orchestrator/agora_cache.db
+orchestrator/agoradns.dat
+orchestrator/agorareport.dat
+orchestrator/agorasdk.log
+orchestrator/agoraapi.log
+# C test binaries
+orchestrator/dec_ref
+orchestrator/rt_ref
+orchestrator/tone_ref

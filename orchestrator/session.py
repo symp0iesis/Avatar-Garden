@@ -28,6 +28,7 @@ import asyncio
 import json
 import array
 import queue
+import struct
 import threading
 import time
 
@@ -60,7 +61,8 @@ class VoiceSession:
     def __init__(self, avatar_id, channel, token, app_id,
                  deepgram_key, cartesia_key, tts_voice_id,
                  backend_base="http://127.0.0.1:5001",
-                 language="multi", full_duplex=False, codec="g722", log=print):
+                 language="multi", full_duplex=False, codec="g722", transport="agora",
+                 rtp_port=26000, log=print):
         self.avatar_id = str(avatar_id)
         self.channel = channel
         self.token = token
@@ -72,6 +74,10 @@ class VoiceSession:
         self.language = language
         self.full_duplex = full_duplex   # web (AEC) -> True; device -> False
         self.codec = codec               # "g722" (device) | "opus" (web)
+        self.transport = transport       # "agora" (SDK) | "rtp" (UDP direct)
+        self.rtp_port = rtp_port         # VPS listen port (rtp mode)
+        self._device_addr = None         # learned from first received packet
+        self._rtp_stats = {"pkts": 0, "samples": 0}
         self.log = log
         self.messages = []               # OpenAI-format turns (backend injects system prompt)
 
@@ -87,10 +93,13 @@ class VoiceSession:
         self._last_activity = time.monotonic()
         self._turn_active = False
         self._enc = g722.G722Encoder()
+        self._g722_dec = None
         self._opus = None
         if codec == "opus":
             import opuslib_next as op
             self._opus = op.Encoder(16000, 1, op.APPLICATION_AUDIO)
+        if transport == "rtp":
+            self._g722_dec = g722.G722Decoder()
 
     # ------------------------- SDK thread -------------------------
     def _sdk_thread(self):
@@ -237,6 +246,8 @@ class VoiceSession:
     # ------------------------- turns -------------------------
     def _on_utterance(self, text):
         self._last_activity = time.monotonic()
+        if not self.full_duplex:
+            self._muted.set()   # half-duplex: gate uplink while we answer
         speaking = self._speaking() or self._turn_active
         if speaking:
             # BARGE-IN: bump generation — publisher drops current sentence at
@@ -317,8 +328,139 @@ class VoiceSession:
                 self._muted.clear()
             self._turn_active = False
 
+# ------------------------- RTP transport (Fase 6) -------------------------
+    def _run_rtp(self, idle_timeout_s, max_duration_s):
+        """Device talks raw UDP/RTP G722 directly to us — no Agora at all."""
+        import socket
+        self.log(f"[rtp] binding 0.0.0.0:{self.rtp_port} (device connects from its "
+                 f"source addr; NAT hole via its own packets)")
+        self._stop_publish = threading.Event()
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("0.0.0.0", self.rtp_port))
+        sock.settimeout(0.2)
+        self._rtp_sock = sock
+
+        t_tts = threading.Thread(target=self._tts_worker, daemon=True)
+        t_tts.start()
+        t_pub = threading.Thread(target=self._rtp_publisher, args=(sock,), daemon=True)
+        t_pub.start()
+
+        streamer = DeepgramStreamer(
+            self.dg_key, language=self.language,
+            on_interim=lambda t: setattr(self, "_last_activity", time.monotonic()),
+            on_utterance=self._on_utterance)
+        loop = asyncio.new_event_loop()
+        t_loop = threading.Thread(
+            target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()),
+            daemon=True)
+        t_loop.start()
+        asyncio.run_coroutine_threadsafe(streamer.connect(), loop).result(15)
+
+        self.log(f"[orch] live (rtp): avatar={self.avatar_id} channel={self.channel} "
+                 f"mode={'full-duplex' if self.full_duplex else 'half-duplex'} "
+                 f"codec=g722 idle={idle_timeout_s}s")
+        self.log(f"[rtp] SPEAK to the sculpture — downlink flows once its addr is known")
+        t_start = time.monotonic()
+        self._gen = 0
+        while True:
+            now = time.monotonic()
+            if max_duration_s and now - t_start > max_duration_s:
+                self.log("[rtp] max duration reached — ending session")
+                break
+            if (not self._turn_active and now - self._last_activity > idle_timeout_s
+                    and not self._speaking()):
+                self.log("[rtp] auto-idle — ending session")
+                break
+            # uplink: RTP packet -> G722 payload -> decode -> PCM -> ASR
+            try:
+                pkt, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            if len(pkt) < 12:
+                continue
+            if self._device_addr is None:
+                self._device_addr = addr
+                self.log(f"[rtp] device registered from {addr[0]}:{addr[1]}")
+            elif addr != self._device_addr:
+                continue  # only the registered device
+            # half-duplex gate: discard uplink while the avatar speaks
+            if not self.full_duplex and self._muted.is_set():
+                continue
+            self._last_activity = max(self._last_activity, time.monotonic())
+            payload = self._rtp_payload(pkt)
+            pcm = self._g722_dec.decode(payload)
+            self._rtp_stats["pkts"] += 1
+            self._rtp_stats["samples"] += len(pcm)
+            if self._rtp_stats["pkts"] % 50 == 0:
+                self.log(f"[rtp] rx {self._rtp_stats['pkts']} pkts, "
+                         f"{self._rtp_stats['samples']} samples decoded, "
+                         f"last payload {len(payload)} B")
+            asyncio.run_coroutine_threadsafe(streamer.send_audio(
+                struct.pack("<%dh" % len(pcm), *pcm)), loop)
+
+        asyncio.run_coroutine_threadsafe(streamer.close(), loop).result(10)
+        loop.call_soon_threadsafe(loop.stop)
+        self._stop.set()
+        sock.close()
+        self.log("[rtp] session ended")
+
+    def _rtp_publisher(self, sock):
+        """Encoded frames -> RTP packets -> device (absolute 20 ms schedule)."""
+        self._rtp_seq = 0
+        self._rtp_ts = 0
+        while not self._stop.is_set():
+            try:
+                gen, frames = self._pcm_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if gen != self._gen or self._device_addr is None:
+                continue
+            try:
+                next_t = time.monotonic()
+                self._push_busy = True
+                for f in frames:
+                    if self._stop.is_set() or gen != self._gen:
+                        break
+                    sock.sendto(self._rtp_packet(f, self._rtp_seq, self._rtp_ts),
+                                self._device_addr)
+                    self._rtp_seq = (self._rtp_seq + 1) & 0xFFFF
+                    self._rtp_ts = (self._rtp_ts + 320) & 0xFFFFFFFF
+                    next_t += 0.02
+                    delay = next_t - time.monotonic()
+                    if delay > 0:
+                        time.sleep(delay)
+                self._last_push = time.monotonic()
+            except Exception as e:
+                self.log(f"[rtp] publisher error: {e}")
+            finally:
+                self._push_busy = False
+
+    @staticmethod
+    def _rtp_payload(pkt):
+        """Strip the 12-byte RTP header (+ optional CSRC/extensions) -> payload."""
+        b0 = pkt[0]
+        version = b0 >> 6
+        if version != 2:
+            return pkt  # not RTP — treat as raw payload (device keepalive etc.)
+        cc = b0 & 0x0F
+        header_len = 12 + 4 * cc
+        if len(pkt) > header_len and (pkt[0] & 0x10):  # extension bit
+            ext_len = struct.unpack(">H", pkt[header_len + 2:header_len + 4])[0]
+            header_len += 4 + 2 * ext_len
+        return pkt[header_len:]
+
+    def _rtp_packet(self, payload, seq, ts):
+        """12-byte RTP header (incl. SSRC), PT 96 (dynamic G722), no CSRC."""
+        b0 = 0x80  # version 2, no padding, no extension, cc=0
+        return struct.pack("!BBHII", b0, 96, seq & 0xFFFF, ts, 0x77700001) + payload
+
     # ------------------------- session loop -------------------------
     def run(self, idle_timeout_s=IDLE_TIMEOUT_S, max_duration_s=MAX_DURATION_S):
+        if self.transport == "rtp":
+            self._run_rtp(idle_timeout_s=idle_timeout_s, max_duration_s=max_duration_s)
+            return
         self._sdk_ready = threading.Event()
         t_sdk = threading.Thread(target=self._sdk_thread, daemon=True)
         t_sdk.start()
