@@ -2080,6 +2080,72 @@ def get_voice_token():
     return jsonify({"appId": agora_app_id, "channel": channel, "uid": uid, "token": token})
 
 
+# --- ConvoAI reaper: lingering agents burn $0.10/min (2026-09-15 bill:
+# 148 paid minutes). Every agent/start registers {agentId: channel, started};
+# the voice callback timestamps the channel's last turn; a thread stops any
+# agent idle > REAPER_MINUTES. Survives backend restarts via convo_agents.json.
+try:
+    _convo_agents = json.load(open(_convo_registry_path, "r"))
+except Exception:
+    _convo_agents = {}
+CONVO_REAPER_MINUTES = 10
+CONVO_REAPER_TICK_S = 60
+_convo_agents = {}        # agent_id -> {"channel", "started"}
+_convo_last_turn = {}     # channel -> monotonic timestamp of last LLM turn
+_convo_registry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "convo_agents.json")
+
+
+def _convo_register(agent_id, channel):
+    _convo_agents[agent_id] = {"channel": channel, "started": time.time()}
+    try:
+        json.dump(_convo_agents, open(_convo_registry_path, "w"))
+    except Exception as e:
+        print(f"[reaper] registry save failed: {e}")
+
+
+def _convo_unregister(agent_id):
+    _convo_agents.pop(agent_id, None)
+    try:
+        json.dump(_convo_agents, open(_convo_registry_path, "w"))
+    except Exception:
+        pass
+
+
+def _convo_reaper_loop():
+    while True:
+        time.sleep(CONVO_REAPER_TICK_S)
+        # merge external registrations (device/backend spawns in other processes,
+        # manual registry edits) — the file is the source of truth
+        try:
+            reg = json.load(open(_convo_registry_path, "r"))
+            for k, v in reg.items():
+                _convo_agents.setdefault(k, v)
+        except Exception:
+            pass
+        now = time.time()
+        if _convo_agents:
+            print(f"[reaper] tick: {len(_convo_agents)} agent(s) tracked")
+        for agent_id, info in list(_convo_agents.items()):
+            last_turn = _convo_last_turn.get(info["channel"], 0)
+            last = max(info["started"], last_turn)
+            if now - last > CONVO_REAPER_MINUTES * 60:
+                print(f"[reaper] stopping idle ConvoAI agent {agent_id} "
+                      f"(channel {info['channel']}, idle > {CONVO_REAPER_MINUTES} min)")
+                try:
+                    requests.post(
+                        f"{AGORA_CONV_AI_BASE}/{get_integration_key('AGORA_APP_ID')}/agents/{agent_id}/leave",
+                        headers=_agora_auth_headers(), timeout=15)
+                except Exception as e:
+                    print(f"[reaper] leave failed: {e}")
+                _convo_unregister(agent_id)
+
+
+print(f"[reaper] active: tick {CONVO_REAPER_TICK_S}s, idle threshold {CONVO_REAPER_MINUTES}min, "
+          f"{len(_convo_agents)} agents tracked")
+threading.Thread(target=_convo_reaper_loop, daemon=True).start()
+
+
 @voice_bp.route("/api/voice/agent/start", methods=["POST"])
 def start_voice_agent():
     """Start a voice agent for the given avatar and channel.
@@ -2175,6 +2241,7 @@ def start_voice_agent():
             },
             "llm": {
                 "url": f"{BACKEND_PUBLIC_URL}/api/voice/chat-completions?avatar={avatar_id}"
+                       + f"&channel={channel}"
                        + ("&streaming=1" if streaming else ""),
                 "vendor": "custom",
                 "style": "openai",
@@ -2234,6 +2301,7 @@ def start_voice_agent():
     agent_data = resp.json()
     agent_id = agent_data.get("agent_id") or agent_data.get("id")
     print(f"[Voice] Agent started: {agent_id}")
+    _convo_register(agent_id, channel)
     return jsonify({"agentId": agent_id, "channel": channel})
 
 
@@ -2413,6 +2481,9 @@ def voice_chat_completions():
     from flask import stream_with_context
 
     avatar_id = str(request.args.get("avatar", "0"))
+    _chan = request.args.get("channel")
+    if _chan:
+        _convo_last_turn[_chan] = time.time()
     data = request.get_json() or {}
     messages = data.get("messages", [])
 
