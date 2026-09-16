@@ -261,7 +261,7 @@ export default function AvatarsChatVoice() {
         body: JSON.stringify({
           avatarId: selectedAvatarId,
           channel: channelRef.current,
-          userUid: uid || 0,
+          userUid: 0,
           streaming: streamingEnabled,
         }),
       });
