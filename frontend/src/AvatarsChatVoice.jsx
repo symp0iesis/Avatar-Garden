@@ -622,6 +622,20 @@ export default function AvatarsChatVoice() {
         <p className="text-sm text-garden-clay max-w-sm text-center font-poetic">{error}</p>
       )}
 
+      {/* Force quit — escape hatch for orphaned sessions */}
+      <button
+        className="text-xs text-garden-inksoft underline hover:text-garden-ink cursor-pointer"
+        onClick={async () => {
+          try {
+            const r = await fetch("/api/voice/sessions/stop-all", { method: "POST" });
+            const d = await r.json();
+            setError(d.stopped?.length ? `Force quit: ${d.stopped.join(", ")}` : "Nothing live to quit");
+          } catch (_e) { setError("Force quit failed"); }
+        }}
+      >
+        force quit any live session
+      </button>
+
       {/* Device integration guide */}
       {!isConnected && (
         <details className="mt-4 max-w-lg w-full">

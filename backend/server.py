@@ -2400,20 +2400,33 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
         resp["deviceUid"] = device_uid
     if transport == "ws":
         resp["wsPath"] = "/voice-ws"
-        # wait for the orchestrator WS server to accept (the browser connects
-        # immediately after this response — a race otherwise)
-        import time as _t
-        _deadline = _t.time() + 10
-        while _t.time() < _deadline:
-            try:
-                _probe = socket.create_connection(("127.0.0.1", 8010), timeout=1)
-                _probe.close()
-                break
-            except OSError:
-                _t.sleep(0.3)
-        else:
-            print("[Voice] ws port 8010 not accepting within 10s")
     return jsonify(resp)
+
+
+@voice_bp.route("/api/voice/sessions/stop-all", methods=["POST"])
+def voice_sessions_stop_all():
+    """Force quit: every live orchestrator session + every tracked ConvoAI agent.
+    The escape hatch for orphaned sessions (browser closed without End, etc.)."""
+    stopped = []
+    for channel, s in list(_orch_sessions.items()):
+        if _session_alive(s["pid"]):
+            try:
+                os.kill(s["pid"], signal.SIGTERM)
+                stopped.append(f"{channel} (pid {s['pid']})")
+            except OSError:
+                pass
+        _orch_sessions.pop(channel, None)
+    for agent_id, info in list(_convo_agents.items()):
+        try:
+            requests.post(
+                f"{AGORA_CONV_AI_BASE}/{get_integration_key('AGORA_APP_ID')}/agents/{agent_id}/leave",
+                headers=_agora_auth_headers(), timeout=10)
+            stopped.append(f"convoai {agent_id}")
+        except Exception:
+            pass
+        _convo_unregister(agent_id)
+    print(f"[Voice] Force quit: {stopped or 'nothing live'}")
+    return jsonify({"stopped": stopped})
 
 
 @voice_bp.route("/api/voice/agent/stop", methods=["POST"])
