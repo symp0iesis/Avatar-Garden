@@ -2245,16 +2245,23 @@ _orch_sessions = {}  # channel -> {"pid", "agent_id", "avatar_id", "started", ..
 ORCH_RTP_PORT_BASE = 26100
 ORCH_RTP_PORT_MAX = 26999
 
+def _session_alive(pid):
+    """Registry entries can be stale (crashed sessions, pid reuse) — verify
+    the process identity via /proc cmdline, not just os.kill."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"orchestrator_main" in f.read()
+    except OSError:
+        return False
+
+
 def _alloc_rtp_port():
     used = set()
     for s in list(_orch_sessions.values()):
         if "rtp_port" not in s:
             continue
-        try:
-            os.kill(s["pid"], 0)   # still alive?
+        if _session_alive(s["pid"]):
             used.add(s["rtp_port"])
-        except OSError:
-            pass  # dead session — port reusable
     p = ORCH_RTP_PORT_BASE
     while p <= ORCH_RTP_PORT_MAX:
         if p not in used:
@@ -2300,13 +2307,9 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
         cmd += ["--rtp-port", str(rtp_port)]
     if transport == "ws":
         for s in list(_orch_sessions.values()):
-            if s.get("transport") == "ws":
-                try:
-                    os.kill(s["pid"], 0)
-                    return jsonify({"error": "another WebSocket voice session is live",
-                                    "agentId": s["agent_id"], "channel": "ws"}), 409
-                except OSError:
-                    pass
+            if s.get("transport") == "ws" and _session_alive(s["pid"]):
+                return jsonify({"error": "another WebSocket voice session is live",
+                                "agentId": s["agent_id"], "channel": "ws"}), 409
         cmd += ["--ws-port", "8010"]
     proc = subprocess.Popen(
         cmd, cwd=ORCH_DIR, stdout=log_f, stderr=subprocess.STDOUT,
