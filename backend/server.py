@@ -2400,6 +2400,19 @@ def _start_orchestrator_session(avatar_id, channel, full_duplex=False, codec="g7
         resp["deviceUid"] = device_uid
     if transport == "ws":
         resp["wsPath"] = "/voice-ws"
+        # wait for the orchestrator WS server to accept (the browser connects
+        # immediately after this response — a race otherwise)
+        import time as _t
+        _deadline = _t.time() + 10
+        while _t.time() < _deadline:
+            try:
+                _probe = socket.create_connection(("127.0.0.1", 8010), timeout=1)
+                _probe.close()
+                break
+            except OSError:
+                _t.sleep(0.3)
+        else:
+            print("[Voice] ws port 8010 not accepting within 10s")
     return jsonify(resp)
 
 

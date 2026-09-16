@@ -358,6 +358,7 @@ export default function MultiAvatarChat() {
           voiceChatProvider: currentUserVoiceChatProvider,
           voiceChatModel: currentUserVoiceChatModel,
           voiceBackend: vpsVoiceOn ? "vps" : "convoai",
+          voiceTransport: voiceTransport,
         }),
       });
 
@@ -496,6 +497,23 @@ export default function MultiAvatarChat() {
   const selectedAvatar = avatars.find(a => a.id === selectedAvatarId) || null;
   const keywordLlmOn = selectedAvatar ? selectedAvatar.keywordMode === "llm" : true;
   const vpsVoiceOn = selectedAvatar ? (selectedAvatar.llmDefaults?.voiceBackend === "vps") : false;
+  const voiceTransport = selectedAvatar ? (selectedAvatar.llmDefaults?.voiceTransport || "agora") : "agora";
+
+  const handleSetVoiceTransport = async (t) => {
+    if (!selectedAvatarId) return;
+    try {
+      const resp = await fetch(`/api/avatars/${selectedAvatarId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ voiceTransport: t }),
+      });
+      if (!resp.ok) throw new Error((await resp.json()).error || "Save failed");
+      const updated = await fetch("/api/avatars").then(r => r.json());
+      setAvatars(updated);
+    } catch (e) {
+      console.error("Failed to set voice transport:", e);
+    }
+  };
 
   const handleToggleVoiceBackend = async (checked) => {
     if (!selectedAvatarId) return;
@@ -1176,6 +1194,21 @@ export default function MultiAvatarChat() {
                         </span>
                       )}
                   </div>
+                  {vpsVoiceOn && (
+                    <div className="flex items-center gap-2 mt-2 pt-2 border-t border-garden-line/60">
+                        <label className="font-poetic text-garden-inksoft text-xs whitespace-nowrap">Device transport:</label>
+                        <select
+                            className="flex-1 p-1.5 rounded-md border border-garden-line bg-garden-paper font-poetic text-xs"
+                            value={voiceTransport}
+                            onChange={e => handleSetVoiceTransport(e.target.value)}
+                        >
+                            <option value="agora">Agora RTC (validated)</option>
+                            <option value="ws">VPS WebSocket (works without Agora)</option>
+                            <option value="rtp">VPS RTP direct (experimental)</option>
+                        </select>
+                    </div>
+                  )}
+              </div>
               </div>
 
               {/* Voice (Cartesia TTS) — per-avatar voice + synthesis language */}
