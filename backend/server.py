@@ -2183,21 +2183,23 @@ def start_voice_agent():
         "voiceBackend", "convoai")).lower()
     llm_d = (avatar or {}).get("llmDefaults", {})
     # Streaming preference — one per-avatar knob for whichever engine is
-    # active. Explicit per-request flag wins (legacy web clients still send
-    # it); otherwise the admin choice (llmDefaults.streaming, legacy key
-    # ttsStreaming); ConvoAI default stays off (opt-in), matching the old
-    # voice-UI toggle default. The VPS orchestrator reads the same avatar
-    # pref itself at spawn time.
-    if data.get("streaming") is None:
-        streaming = bool(llm_d.get("streaming", llm_d.get("ttsStreaming", False)))
-    else:
+    # active. A web client's explicit per-request flag still wins (legacy);
+    # device firmware sends hardcoded values that are not user choices, so
+    # the admin pref always rules there. Otherwise the avatar's admin choice
+    # (llmDefaults.streaming, legacy key ttsStreaming); ConvoAI default stays
+    # off (opt-in), matching the old voice-UI toggle default. The VPS
+    # orchestrator reads the same avatar pref itself at spawn time.
+    is_device = isinstance(agent_parameters, dict) and bool(agent_parameters)
+    if not is_device and data.get("streaming") is not None:
         streaming = bool(data["streaming"])
+    else:
+        streaming = bool(llm_d.get("streaming", llm_d.get("ttsStreaming", False)))
     if voice_backend == "vps":
         # Web clients omit `parameters` (no output_audio_codec) — they have
         # browser AEC, so full-duplex + barge-in is safe, and they always ride
         # the Agora transport (browsers speak WebRTC, not raw RTP). Device
         # clients send parameters — they honor the avatar's transport choice.
-        is_device = isinstance(agent_parameters, dict) and bool(agent_parameters)
+        # (is_device was computed with the streaming resolution above.)
         full_duplex = not is_device
         voice_transport = str(llm_d.get("voiceTransport", "agora")).lower()
         if voice_transport == "ws":
