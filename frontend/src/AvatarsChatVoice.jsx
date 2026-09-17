@@ -29,9 +29,6 @@ export default function AvatarsChatVoice() {
 
   const [latencyExpanded, setLatencyExpanded] = useState(false);
   const [lastLatency, setLastLatency] = useState(null); // { perceivedMs, timings }
-  // Experimental: stream LLM sentences to Agora (TTS starts sooner). Off by
-  // default — Agora-side chunk handling still being ironed out (ISSUES.md 14).
-  const [streamingEnabled, setStreamingEnabled] = useState(false);
 
   const clientRef = useRef(null);
   const micTrackRef = useRef(null);
@@ -58,6 +55,7 @@ export default function AvatarsChatVoice() {
   const lastVoiceActivityRef = useRef(null);
   const agentSpeakingRef = useRef(false);
   const agentQuietSinceRef = useRef(null);
+  const agentLastAudioRef = useRef(0);
   const avatarIdRef = useRef(null);
 
   const onAgentTurnStart = async (now) => {
@@ -186,19 +184,11 @@ export default function AvatarsChatVoice() {
       const v = peak / 32768;
       setAvatarVolume(v);
       // Rising edge = the agent's reply audio just started -> latency measurement
-      const now = performance.now();
       if (v > 0.08) {
+        agentLastAudioRef.current = performance.now();
         if (!agentSpeakingRef.current) {
           agentSpeakingRef.current = true;
-          onAgentTurnStartRef.current(now);
-        }
-        agentQuietSinceRef.current = null;
-      } else if (agentSpeakingRef.current) {
-        if (agentQuietSinceRef.current == null) {
-          agentQuietSinceRef.current = now;
-        } else if (now - agentQuietSinceRef.current > 1000) {
-          agentSpeakingRef.current = false;
-          agentQuietSinceRef.current = null;
+          onAgentTurnStartRef.current(performance.now());
         }
       }
       // schedule playback (continuous stream)
@@ -275,6 +265,11 @@ export default function AvatarsChatVoice() {
       // Anchor for perceived latency — the WS path has no Agora track volume,
       // so track the user's last voice activity off the analyser.
       if (u > 0.1) lastVoiceActivityRef.current = performance.now();
+      // Reset the agent-speaking latch once reply audio has stopped: chunks
+      // stop arriving entirely between turns, so this must run on a clock.
+      if (agentSpeakingRef.current && performance.now() - agentLastAudioRef.current > 1200) {
+        agentSpeakingRef.current = false;
+      }
       setUserVolume(u);
       requestAnimationFrame(poll);
     };
@@ -299,7 +294,6 @@ export default function AvatarsChatVoice() {
           avatarId: selectedAvatarId,
           channel: channelRef.current,
           userUid: 0,
-          streaming: streamingEnabled,
         }),
       });
       if (!startResp.ok) {
@@ -409,7 +403,6 @@ export default function AvatarsChatVoice() {
           avatarId: selectedAvatarId,
           channel,
           userUid: uid || 0,
-          streaming: streamingEnabled,
         }),
       });
 
@@ -484,24 +477,6 @@ export default function AvatarsChatVoice() {
               ))}
             </select>
           </div>
-          {/* Streaming toggle — ConvoAI sessions only (the VPS orchestrator always
-              streams); applies to the next conversation start */}
-          {!isConnected && selectedAvatar?.llmDefaults?.voiceBackend !== "vps" && (
-          <div className="flex items-center justify-between p-3 rounded-lg border border-garden-line bg-garden-paper2">
-            <div className="pr-3">
-              <p className="font-poetic text-garden-ink text-sm font-medium">Streaming responses</p>
-              <p className="font-poetic text-garden-inksoft text-xs mt-0.5">Experimental — speech starts sooner</p>
-            </div>
-            <button
-              role="switch"
-              aria-checked={streamingEnabled}
-              onClick={() => setStreamingEnabled(!streamingEnabled)}
-              className={"relative w-11 h-6 rounded-full transition-colors duration-200 shrink-0 " + (streamingEnabled ? "bg-garden-moss" : "bg-garden-line")}
-            >
-              <span className={"absolute top-0.5 left-0.5 w-5 h-5 bg-garden-paper rounded-full shadow transition-transform duration-200 " + (streamingEnabled ? "translate-x-5" : "translate-x-0")} />
-            </button>
-          </div>
-          )}
         </div>
       )}
 

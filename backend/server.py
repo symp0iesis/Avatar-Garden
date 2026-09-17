@@ -1626,6 +1626,8 @@ def avatar_detail(avatar_id):
     # TTS streaming toggle (Cartesia SSE vs full-sentence fetch) — boolean
     if "ttsStreaming" in data and data["ttsStreaming"] is not None:
         avatar.setdefault("llmDefaults", {})["ttsStreaming"] = bool(data["ttsStreaming"])
+    if "streaming" in data and data["streaming"] is not None:
+        avatar.setdefault("llmDefaults", {})["streaming"] = bool(data["streaming"])
 
     # Handle ragLanguages separately (comma-separated string to list)
     if "ragLanguages" in data and data["ragLanguages"] is not None:
@@ -1732,12 +1734,14 @@ def avatar_llm_defaults(avatar_id):
         incoming["voiceBackend"] = str(data["voiceBackend"]).lower()
     if "ttsStreaming" in data and data["ttsStreaming"] is not None:
         incoming["ttsStreaming"] = bool(data["ttsStreaming"])
+    if "streaming" in data and data["streaming"] is not None:
+        incoming["streaming"] = bool(data["streaming"])
 
     # Merge into existing defaults rather than replacing wholesale — a payload
     # missing a task's fields must not wipe that task (avatars.json lost
     # defaults twice on 2026-08-11 to partial/implicit saves; see ISSUES.md 13).
     llm_defaults = dict(avatar.get("llmDefaults", {}))
-    for k in ("voiceBackend", "voiceTransport", "ttsStreaming"):
+    for k in ("voiceBackend", "voiceTransport", "ttsStreaming", "streaming"):
         if k in incoming:
             llm_defaults[k] = incoming.pop(k)
     for task, cfg in incoming.items():
@@ -2164,7 +2168,6 @@ def start_voice_agent():
     avatar_id = str(data.get("avatarId", "0"))
     channel = data.get("channel", "avatar-lab")
     user_uid = data.get("userUid", 0)
-    streaming = bool(data.get("streaming"))
     # Optional per-request agent parameters (e.g. output_audio_codec for the
     # ReSpeaker hardware client). Web clients omit it -> payload unchanged.
     agent_parameters = data.get("parameters")
@@ -2179,6 +2182,16 @@ def start_voice_agent():
     voice_backend = str((avatar or {}).get("llmDefaults", {}).get(
         "voiceBackend", "convoai")).lower()
     llm_d = (avatar or {}).get("llmDefaults", {})
+    # Streaming preference — one per-avatar knob for whichever engine is
+    # active. Explicit per-request flag wins (legacy web clients still send
+    # it); otherwise the admin choice (llmDefaults.streaming, legacy key
+    # ttsStreaming); ConvoAI default stays off (opt-in), matching the old
+    # voice-UI toggle default. The VPS orchestrator reads the same avatar
+    # pref itself at spawn time.
+    if data.get("streaming") is None:
+        streaming = bool(llm_d.get("streaming", llm_d.get("ttsStreaming", False)))
+    else:
+        streaming = bool(data["streaming"])
     if voice_backend == "vps":
         # Web clients omit `parameters` (no output_audio_codec) — they have
         # browser AEC, so full-duplex + barge-in is safe, and they always ride
@@ -2288,7 +2301,8 @@ def start_voice_agent():
         }
     }
 
-    print(f"[Voice] Starting agent for avatar {avatar_id} on channel {channel}")
+    print(f"[Voice] Starting agent for avatar {avatar_id} on channel {channel} "
+          f"(streaming={streaming})")
     resp = requests.post(
         f"{AGORA_CONV_AI_BASE}/{agora_app_id}/join",
         headers=_agora_auth_headers(),

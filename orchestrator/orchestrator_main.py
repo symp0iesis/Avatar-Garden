@@ -55,13 +55,15 @@ def main():
         f"{BASE}/api/voice/token?channel={args.channel}&uid={ORCH_UID}").json()
     print(f"[main] token for {args.channel} uid {ORCH_UID}", flush=True)
 
+    _ld = av.get("llmDefaults", {})
+
     s = VoiceSession(
         avatar_id=args.avatar, channel=args.channel, token=creds["token"],
         app_id=creds["appId"], deepgram_key=env["DEEPGRAM_API_KEY"],
         cartesia_key=env["CARTESIA_API_KEY"],
         tts_voice_id=av.get("ttsVoiceId") or "default",
         tts_streaming=(not args.no_tts_streaming) and bool(
-            av.get("llmDefaults", {}).get("ttsStreaming", True)),
+            _ld.get("streaming", _ld.get("ttsStreaming", True))),
         full_duplex=args.full_duplex, codec=args.codec,
         transport=("ws" if args.ws_port else ("rtp" if args.rtp_port else "agora")),
         rtp_port=args.rtp_port, ws_port=args.ws_port)
