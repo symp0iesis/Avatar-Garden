@@ -183,7 +183,24 @@ export default function AvatarsChatVoice() {
       // RMS for the avatar orb
       let peak = 0;
       for (let i = 0; i < pcm.length; i += 16) peak = Math.max(peak, Math.abs(pcm[i]));
-      setAvatarVolume(peak / 32768);
+      const v = peak / 32768;
+      setAvatarVolume(v);
+      // Rising edge = the agent's reply audio just started -> latency measurement
+      const now = performance.now();
+      if (v > 0.08) {
+        if (!agentSpeakingRef.current) {
+          agentSpeakingRef.current = true;
+          onAgentTurnStartRef.current(now);
+        }
+        agentQuietSinceRef.current = null;
+      } else if (agentSpeakingRef.current) {
+        if (agentQuietSinceRef.current == null) {
+          agentQuietSinceRef.current = now;
+        } else if (now - agentQuietSinceRef.current > 1000) {
+          agentSpeakingRef.current = false;
+          agentQuietSinceRef.current = null;
+        }
+      }
       // schedule playback (continuous stream)
       const buf = ctx.createBuffer(1, pcm.length, 16000);
       const ch = buf.getChannelData(0);
@@ -191,8 +208,8 @@ export default function AvatarsChatVoice() {
       const srcNode = ctx.createBufferSource();
       srcNode.buffer = buf;
       srcNode.connect(ctx.destination);
-      const now = ctx.currentTime;
-      if (playNextRef.current < now + 0.05) playNextRef.current = now + 0.05;
+      const nowAudio = ctx.currentTime;
+      if (playNextRef.current < nowAudio + 0.05) playNextRef.current = nowAudio + 0.05;
       srcNode.start(playNextRef.current);
       playNextRef.current += buf.duration;
       if (speakTimer) clearTimeout(speakTimer);
@@ -254,7 +271,11 @@ export default function AvatarsChatVoice() {
       analyser.getByteTimeDomainData(volData);
       let peak = 0;
       for (let i = 0; i < volData.length; i++) peak = Math.max(peak, Math.abs(volData[i] - 128));
-      setUserVolume(peak / 128);
+      const u = peak / 128;
+      // Anchor for perceived latency — the WS path has no Agora track volume,
+      // so track the user's last voice activity off the analyser.
+      if (u > 0.1) lastVoiceActivityRef.current = performance.now();
+      setUserVolume(u);
       requestAnimationFrame(poll);
     };
     poll();
@@ -541,12 +562,16 @@ export default function AvatarsChatVoice() {
                   if (backendOther > 0) segments.push({ label: "Backend overhead", ms: backendOther, color: "#A8A29E" });
                 }
                 const agora = Math.max(lastLatency.perceivedMs - attributed, 0);
-                if (agora > 0) segments.push({ label: isStreaming ? "TTS streaming + Agora pipeline (rest of reply)" : "Agora pipeline (ASR + TTS + transport)", ms: agora, color: "#475569" });
+                if (agora > 0) segments.push({ label: isWs
+                  ? "ASR + TTS + transport (self-hosted)"
+                  : (isStreaming ? "TTS streaming + Agora pipeline (rest of reply)" : "Agora pipeline (ASR + TTS + transport)"), ms: agora, color: "#475569" });
                 return (
                   <>
                     <LatencyBreakdown segments={segments} totalMs={lastLatency.perceivedMs} />
                     <p className="mt-2 text-[10px] text-garden-inksoft font-poetic">
-                      Measured from end of your speech to first avatar audio. Agora pipeline time is derived, not directly measured.
+                      Measured from end of your speech to first avatar audio. {isWs
+                        ? "The self-hosted ASR/TTS/transport remainder is derived, not directly measured."
+                        : "Agora pipeline time is derived, not directly measured."}
                     </p>
                   </>
                 );

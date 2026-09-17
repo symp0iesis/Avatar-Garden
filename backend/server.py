@@ -2569,7 +2569,10 @@ def voice_chat_completions():
     ]
 
     _vt0 = time.perf_counter()
-    vtimings = {}
+    vtimings = {"ts": time.time()}
+    # Register early: the WS/vps path streams TTS per sentence, so the browser
+    # can fetch timings before the full reply (and _finalize) has completed.
+    _last_voice_timings[avatar_id] = vtimings
 
     # RAG context injection
     # Voice RAG: LLM-based keyword generation (same path as chat) — context-aware
