@@ -57,6 +57,13 @@ export default function AvatarsChatVoice() {
   const agentQuietSinceRef = useRef(null);
   const agentLastAudioRef = useRef(0);
   const avatarIdRef = useRef(null);
+  // Voice-activity anchor the last latency measurement was taken at. The agent
+  // speaks one reply per user turn, but non-streaming TTS arrives in
+  // per-sentence bursts whose gaps exceed the quiet threshold — without this
+  // guard each burst re-triggers the "turn start" and the panel shows several
+  // conflicting results per reply. A new turn always moves the anchor (the
+  // user spoke again), so one measurement per reply is guaranteed.
+  const measuredTurnAnchorRef = useRef(null);
 
   const onAgentTurnStart = async (now) => {
     const t0 = lastVoiceActivityRef.current;
@@ -184,11 +191,15 @@ export default function AvatarsChatVoice() {
       const v = peak / 32768;
       setAvatarVolume(v);
       // Rising edge = the agent's reply audio just started -> latency measurement
+      // (once per user turn — see measuredTurnAnchorRef)
       if (v > 0.08) {
         agentLastAudioRef.current = performance.now();
         if (!agentSpeakingRef.current) {
           agentSpeakingRef.current = true;
-          onAgentTurnStartRef.current(performance.now());
+          if (lastVoiceActivityRef.current !== measuredTurnAnchorRef.current) {
+            measuredTurnAnchorRef.current = lastVoiceActivityRef.current;
+            onAgentTurnStartRef.current(performance.now());
+          }
         }
       }
       // schedule playback (continuous stream)
@@ -329,8 +340,12 @@ export default function AvatarsChatVoice() {
             if (v > 0.08) {
               if (!agentSpeakingRef.current) {
                 // Rising edge — the agent's reply audio just started
+                // (once per user turn — see measuredTurnAnchorRef)
                 agentSpeakingRef.current = true;
-                onAgentTurnStartRef.current(now);
+                if (lastVoiceActivityRef.current !== measuredTurnAnchorRef.current) {
+                  measuredTurnAnchorRef.current = lastVoiceActivityRef.current;
+                  onAgentTurnStartRef.current(now);
+                }
               }
               agentQuietSinceRef.current = null;
             } else if (agentSpeakingRef.current) {
