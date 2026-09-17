@@ -614,28 +614,29 @@ web_search(query="your search query")
 """
 
 
-def handle_web_search_tool_call(response_text, avatar_id, llm, chat_history):
+def _prepare_web_search(response_text, avatar_id, chat_history):
     """
-    If response_text contains web_search(query=...), run Brave and re-invoke the
-    LLM with results labeled as an external source. Returns (final_response,
-    was_handled). Mirrors handle_sensor_tool_call; used by the voice callback
-    (buffered + streaming). The per-avatar webSearchEnabled flag gates injection.
+    Extract the web_search(query=...) tool-call query, run Brave, and append
+    the results (labeled as an external source) to chat_history. Returns
+    (query, results) — (None, None) when response_text is not a web_search
+    tool call or the search failed. The caller re-invokes the LLM (buffered
+    or streamed) to produce the final answer.
     """
     if 'web_search(query="' not in response_text:
-        return response_text, False
+        return None, None
 
     q_start = response_text.find('web_search(query="') + len('web_search(query="')
     q_end = response_text.find('")', q_start)
     query = response_text[q_start:q_end] if q_end > q_start else ""
     if not query:
-        return response_text, False
+        return None, None
 
     print(f"[web search] Voice tool-invoked query: {query!r}")
     try:
         ws_results = web_search(query, count=5, api_key=get_integration_key("BRAVE_SEARCH_API_KEY"))
     except Exception as e:
         print(f"[Voice] Web search failed (continuing with original response): {e}")
-        return response_text, False
+        return None, None
     debug_log(avatar_id, "VOICE/WEB_SEARCH_RESULTS", ws_results)
 
     chat_history.append({"role": "assistant", "content": response_text})
@@ -646,6 +647,19 @@ def handle_web_search_tool_call(response_text, avatar_id, llm, chat_history):
         "anything that does not apply to your bioregion. Respond conversationally in "
         "the user's language. Do not return a function call."
     })
+    return query, ws_results
+
+
+def handle_web_search_tool_call(response_text, avatar_id, llm, chat_history):
+    """
+    If response_text contains web_search(query=...), run Brave and re-invoke the
+    LLM with results labeled as an external source. Returns (final_response,
+    was_handled). Mirrors handle_sensor_tool_call; used by the text pipeline and
+    the voice buffered path. The per-avatar webSearchEnabled flag gates injection.
+    """
+    _query, ws_results = _prepare_web_search(response_text, avatar_id, chat_history)
+    if _query is None:
+        return response_text, False
     final = llm.complete(chat_history).text
 
     # Guard against recursive function calls
@@ -2595,6 +2609,19 @@ def voice_chat_completions():
     # can fetch timings before the full reply (and _finalize) has completed.
     _last_voice_timings[avatar_id] = vtimings
 
+    # Sensor snapshot runs concurrently with keyword generation + RAG below —
+    # it is independent of them, costs ~1s, and previously blocked the LLM
+    # start sequentially.
+    sensor_config = avatar_sensor_tools.get(avatar_id)
+    sensor_holder = {}
+    if sensor_config:
+        def _sensor_worker():
+            _ts = time.perf_counter()
+            sensor_holder["summary"] = _fetch_sensor_summary(avatar_id)
+            sensor_holder["ms"] = round((time.perf_counter() - _ts) * 1000)
+        _sensor_thread = threading.Thread(target=_sensor_worker, daemon=True)
+        _sensor_thread.start()
+
     # RAG context injection
     # Voice RAG: LLM-based keyword generation (same path as chat) — context-aware
     # across turns and robust on short/ambiguous utterances. The configured
@@ -2649,12 +2676,12 @@ def voice_chat_completions():
     if _load_ms:
         vtimings["index_load_ms"] = _load_ms
 
-    # Sensor tool prompt injection + always-fetch snapshot
-    sensor_config = avatar_sensor_tools.get(avatar_id)
+    # Sensor tool prompt injection + always-fetch snapshot (fetch started
+    # concurrently above — join here, ~0ms if keyword+RAG took long enough)
     if sensor_config:
-        _ts = time.perf_counter()
-        sensor_summary = _fetch_sensor_summary(avatar_id)
-        vtimings["sensor_snapshot_ms"] = round((time.perf_counter() - _ts) * 1000)
+        _sensor_thread.join()
+        vtimings["sensor_snapshot_ms"] = sensor_holder.get("ms", 0)
+        sensor_summary = sensor_holder.get("summary")
         if sensor_summary:
             chat_history[0]["content"] += SENSOR_SNAPSHOT_INSTRUCTION.format(summary=sensor_summary)
         else:
@@ -2749,8 +2776,9 @@ def voice_chat_completions():
         sensor_mode = False
         web_mode = False
         emitted = False
+        _llm_stream = llm.stream_deltas(chat_history)
         try:
-            for delta in llm.stream_deltas(chat_history):
+            for delta in _llm_stream:
                 if "llm_first_token_ms" not in vtimings:
                     vtimings["llm_first_token_ms"] = round((time.perf_counter() - _tllmv) * 1000)
                 full_parts.append(delta)
@@ -2764,7 +2792,15 @@ def voice_chat_completions():
                         sensor_mode = True  # accumulate silently; tool needs the full call
                     elif web_search_enabled and 'web_search(query="' in buf:
                         web_mode = True  # accumulate silently; search + re-invoke at the end
-                if sensor_mode or web_mode:
+                if sensor_mode:
+                    continue
+                if web_mode:
+                    _qi = buf.find('web_search(query="')
+                    # Only the query is needed — abort the stream instead of
+                    # silently consuming the model's entire (discarded) reply.
+                    if '")' in buf[_qi + len('web_search(query="'):]:
+                        _llm_stream.close()
+                        break
                     continue
 
                 # Flush complete sentences (Agora starts TTS per chunk)
@@ -2797,16 +2833,50 @@ def voice_chat_completions():
                 response_text = sanitize_for_tts(response_text)
                 yield _sse(response_text)
             elif web_mode or ('web_search(query="' in response_text and not emitted):
-                # Web search tool call — silent accumulation completed; run Brave
-                # and re-invoke, then emit the final response as one chunk.
+                # Web search tool call — the first stream was aborted as soon as
+                # the query completed. Run Brave, then stream the final answer
+                # sentence-by-sentence so TTS starts mid-answer, not at the end.
                 _tw = time.perf_counter()
-                response_text, ws_handled = handle_web_search_tool_call(
-                    response_text, avatar_id, llm, chat_history)
-                if ws_handled:
+                _q, _results = _prepare_web_search(response_text, avatar_id, chat_history)
+                if _q is not None:
                     vtimings["web_search_ms"] = round((time.perf_counter() - _tw) * 1000)
-                    print("[Voice] Web search complete")
-                response_text = sanitize_for_tts(response_text)
-                yield _sse(response_text)
+                    print("[Voice] Web search complete — streaming final answer")
+                    full_parts, buf = [], ""
+                    for delta in llm.stream_deltas(chat_history):
+                        full_parts.append(delta)
+                        buf += delta
+                        while True:
+                            m = _SENTENCE_END_RE.search(buf)
+                            if not m:
+                                if len(buf) > 300:
+                                    clean = sanitize_for_tts(buf)
+                                    buf = ""
+                                    if clean:
+                                        emitted = True
+                                        yield _sse(clean + " ")
+                                break
+                            sent, buf = buf[:m.end()], buf[m.end():]
+                            clean = sanitize_for_tts(sent)
+                            if clean:
+                                emitted = True
+                                yield _sse(clean + " ")
+                    response_text = "".join(full_parts)
+                    # Guard against recursive function calls
+                    if 'web_search(query="' in response_text and not emitted:
+                        response_text = sanitize_for_tts(_results.replace("*", ""))
+                        yield _sse(response_text)
+                        emitted = True
+                    else:
+                        tail = sanitize_for_tts(buf)
+                        if tail:
+                            yield _sse(tail)
+                    response_text = sanitize_for_tts(response_text)
+                else:
+                    # Search failed — original behavior: emit the response as-is
+                    # (single chunk).
+                    response_text = sanitize_for_tts(response_text)
+                    yield _sse(response_text)
+                    emitted = True
             else:
                 tail = sanitize_for_tts(buf)
                 if tail:

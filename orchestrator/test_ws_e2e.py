@@ -39,6 +39,7 @@ async def main():
     ap = __import__("argparse").ArgumentParser()
     ap.add_argument("--port", type=int, default=8010)
     ap.add_argument("--avatar", default="4")
+    ap.add_argument("--question", default="Voce pode me contar uma historia curta sobre o rio Marumbi?")
     args = ap.parse_args()
 
     env = load_env()
@@ -54,7 +55,7 @@ async def main():
     q = requests.post("https://api.cartesia.ai/tts/bytes",
         headers={"X-API-Key": env["CARTESIA_API_KEY"], "Content-Type": "application/json",
                  "Cartesia-Version": "2026-08-14"},
-        json={"transcript": "Voce pode me contar uma historia curta sobre o rio Marumbi?",
+        json={"transcript": args.question,
               "model_id": "sonic-3",
               "voice": av.get("ttsVoiceId") or "9904416a-0831-44ea-b8ee-5f145e8f9bbf",
               "output_format": {"container": "raw", "encoding": "pcm_s16le", "sample_rate": RATE}},
