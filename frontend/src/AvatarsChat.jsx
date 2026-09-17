@@ -359,6 +359,7 @@ export default function MultiAvatarChat() {
           voiceChatModel: currentUserVoiceChatModel,
           voiceBackend: vpsVoiceOn ? "vps" : "convoai",
           voiceTransport: voiceTransport,
+          ttsStreaming: ttsStreaming,
         }),
       });
 
@@ -498,6 +499,7 @@ export default function MultiAvatarChat() {
   const keywordLlmOn = selectedAvatar ? selectedAvatar.keywordMode === "llm" : true;
   const vpsVoiceOn = selectedAvatar ? (selectedAvatar.llmDefaults?.voiceBackend === "vps") : false;
   const voiceTransport = selectedAvatar ? (selectedAvatar.llmDefaults?.voiceTransport || "agora") : "agora";
+  const ttsStreaming = selectedAvatar ? (selectedAvatar.llmDefaults?.ttsStreaming !== false) : true;
 
   const handleSetVoiceTransport = async (t) => {
     if (!selectedAvatarId) return;
@@ -528,6 +530,22 @@ export default function MultiAvatarChat() {
       setAvatars(updated);
     } catch (e) {
       console.error("Failed to toggle voice backend:", e);
+    }
+  };
+
+  const handleToggleTtsStreaming = async (checked) => {
+    if (!selectedAvatarId) return;
+    try {
+      const resp = await fetch(`/api/avatars/${selectedAvatarId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ttsStreaming: checked }),
+      });
+      if (!resp.ok) throw new Error((await resp.json()).error || "Save failed");
+      const updated = await fetch("/api/avatars").then(r => r.json());
+      setAvatars(updated);
+    } catch (e) {
+      console.error("Failed to set TTS streaming:", e);
     }
   };
 
@@ -1243,6 +1261,22 @@ export default function MultiAvatarChat() {
                       </Button>
                   </div>
                   {ttsMsg && <p className="mt-1 text-xs text-garden-inksoft">{ttsMsg}</p>}
+                  <div className="flex items-center gap-3 mt-3 pt-3 border-t border-garden-line/60">
+                      <Switch
+                          checked={ttsStreaming}
+                          disabled={!selectedAvatarId}
+                          onCheckedChange={handleToggleTtsStreaming}
+                          className="data-[state=checked]:bg-garden-moss"
+                      />
+                      <span className="font-poetic text-garden-inksoft text-xs">
+                          {ttsStreaming
+                            ? "Streaming TTS — audio starts as Cartesia produces it (lower latency)"
+                            : "Non-streaming — waits for each full sentence before speaking"}
+                      </span>
+                  </div>
+                  <p className="font-poetic text-garden-inksoft text-[10px] mt-1">
+                    Applies to the self-hosted orchestrator (Voice engine = VPS). Agora ConvoAI manages its own TTS.
+                  </p>
               </div>
 
               {/* ── Shared (both labs) ── */}

@@ -1623,6 +1623,9 @@ def avatar_detail(avatar_id):
         avatar.setdefault("llmDefaults", {})["voiceBackend"] = str(data["voiceBackend"]).lower()
     if data.get("voiceTransport") in ("agora", "rtp", "ws"):
         avatar.setdefault("llmDefaults", {})["voiceTransport"] = str(data["voiceTransport"]).lower()
+    # TTS streaming toggle (Cartesia SSE vs full-sentence fetch) — boolean
+    if "ttsStreaming" in data and data["ttsStreaming"] is not None:
+        avatar.setdefault("llmDefaults", {})["ttsStreaming"] = bool(data["ttsStreaming"])
 
     # Handle ragLanguages separately (comma-separated string to list)
     if "ragLanguages" in data and data["ragLanguages"] is not None:
@@ -1727,12 +1730,14 @@ def avatar_llm_defaults(avatar_id):
     # Voice backend routing is part of the Admin Defaults payload
     if data.get("voiceBackend"):
         incoming["voiceBackend"] = str(data["voiceBackend"]).lower()
+    if "ttsStreaming" in data and data["ttsStreaming"] is not None:
+        incoming["ttsStreaming"] = bool(data["ttsStreaming"])
 
     # Merge into existing defaults rather than replacing wholesale — a payload
     # missing a task's fields must not wipe that task (avatars.json lost
     # defaults twice on 2026-08-11 to partial/implicit saves; see ISSUES.md 13).
     llm_defaults = dict(avatar.get("llmDefaults", {}))
-    for k in ("voiceBackend", "voiceTransport"):
+    for k in ("voiceBackend", "voiceTransport", "ttsStreaming"):
         if k in incoming:
             llm_defaults[k] = incoming.pop(k)
     for task, cfg in incoming.items():

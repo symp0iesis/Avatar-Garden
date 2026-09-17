@@ -63,7 +63,7 @@ class VoiceSession:
                  deepgram_key, cartesia_key, tts_voice_id,
                  backend_base="http://127.0.0.1:5001",
                  language="multi", full_duplex=False, codec="g722", transport="agora",
-                 rtp_port=26000, ws_port=8010, log=print):
+                 rtp_port=26000, ws_port=8010, tts_streaming=True, log=print):
         self.avatar_id = str(avatar_id)
         self.channel = channel
         self.token = token
@@ -76,6 +76,7 @@ class VoiceSession:
         self.full_duplex = full_duplex   # web (AEC) -> True; device -> False
         self.codec = codec               # "g722" (device) | "opus" (web)
         self.transport = transport       # "agora" (SDK) | "rtp" (UDP direct)
+        self.tts_streaming = tts_streaming   # Cartesia SSE vs full-sentence fetch
         self.rtp_port = rtp_port         # VPS listen port (rtp mode)
         self.ws_port = ws_port           # VPS listen port (ws mode)
         self._ws_clients = set()         # live websocket clients
@@ -167,10 +168,33 @@ class VoiceSession:
                 continue
             if gen != self._gen:
                 continue  # barged in — drop stale sentence
-            if self.transport in ("rtp", "ws"):
+            raw = self.transport in ("rtp", "ws")   # these carry raw PCM frames
+            if raw and self.tts_streaming:
                 self._tts_stream_to_queue(gen, text)
+            elif raw:
+                self._tts_pcm_to_queue(gen, text)
             else:
                 self._tts_encode_to_queue(gen, text)
+
+    def _tts_pcm_to_queue(self, gen, text):
+        """Raw-PCM transport, non-streaming: fetch the whole sentence first."""
+        _t0 = time.monotonic()
+        self._tts_active += 1
+        try:
+            pcm = self._tts(text)
+            if not pcm or gen != self._gen:
+                return
+            self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
+                     f"({len(pcm) // 32000:.1f}s audio)")
+            chunks = [pcm[i:i + 640] for i in range(0, len(pcm) - 639, 640)]
+            if len(pcm) % 640:
+                chunks.append(pcm[-(len(pcm) % 640):].ljust(640, b"\x00"))
+            if gen == self._gen:
+                self._pcm_q.put((gen, chunks))
+        except Exception as e:
+            self.log(f"[orch] tts error: {e}")
+        finally:
+            self._tts_active -= 1
 
     def _tts_stream_to_queue(self, gen, text):
         """Stream Cartesia PCM into 20 ms frames as it arrives.

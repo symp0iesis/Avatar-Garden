@@ -41,6 +41,8 @@ def main():
     ap.add_argument("--ws-port", type=int, default=0, help="WS listen port (ws transport)")
     ap.add_argument("--full-duplex", action="store_true",
                     help="web client (browser AEC): keep uplink during downlink, allow barge-in")
+    ap.add_argument("--no-tts-streaming", action="store_true",
+                    help="disable Cartesia SSE streaming (fetch each full sentence)")
     args = ap.parse_args()
 
     env = load_env()
@@ -58,6 +60,8 @@ def main():
         app_id=creds["appId"], deepgram_key=env["DEEPGRAM_API_KEY"],
         cartesia_key=env["CARTESIA_API_KEY"],
         tts_voice_id=av.get("ttsVoiceId") or "default",
+        tts_streaming=(not args.no_tts_streaming) and bool(
+            av.get("llmDefaults", {}).get("ttsStreaming", True)),
         full_duplex=args.full_duplex, codec=args.codec,
         transport=("ws" if args.ws_port else ("rtp" if args.rtp_port else "agora")),
         rtp_port=args.rtp_port, ws_port=args.ws_port)
