@@ -164,28 +164,19 @@ export default function AvatarsChatVoice() {
     setIsWs(true);
     startRef.current = start.agentId;
     setStatus("connecting");
+    setError(null);
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(proto + "//" + location.host + start.wsPath);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
-    // Mic FIRST: Chromium delivers SILENCE from MediaStreamSource when the
-    // context rate differs from the INPUT device's rate (headsets often run
-    // 44.1k while the output runs 48k). Create the context at the mic's own
-    // reported rate after the stream exists.
-    const micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
-    micStreamRef.current = micStream;
-    const micRate = micStream.getAudioTracks()[0].getSettings().sampleRate || 48000;
-    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: micRate });
-    audioCtxRef.current = ctx;
-    if (ctx.state === "suspended") await ctx.resume();
-    playNextRef.current = 0;
-
+    // Wire and await the socket FIRST (bounded), so a stalled mic permission
+    // prompt can never wedge the UI at "connecting".
+    let ctx = null;
     let speakTimer = null;
+    ws.onerror = (e) => { console.error("ws error", e); setError("WebSocket error"); setStatus("error"); };
     ws.onmessage = (e) => {
-      if (!(e.data instanceof ArrayBuffer)) return;
+      if (!ctx || !(e.data instanceof ArrayBuffer)) return;
       const pcm = new Int16Array(e.data);
       if (!pcm.length) return;
       setStatus("speaking");
@@ -210,11 +201,27 @@ export default function AvatarsChatVoice() {
         setStatus("listening");
       }, 600);
     };
-    ws.onerror = (e) => { console.error("ws error", e); setError("WebSocket error"); setStatus("error"); };
     await new Promise((res, rej) => {
-      ws.onopen = res;
-      ws.onclose = () => rej(new Error("voice websocket closed"));
+      const t = setTimeout(() => rej(new Error("voice websocket timed out (no server response)")), 12000);
+      ws.onopen = () => { clearTimeout(t); res(); };
+      ws.onclose = () => { clearTimeout(t); rej(new Error("voice websocket closed")); };
     });
+
+    // Mic AFTER the socket: Chromium delivers SILENCE from MediaStreamSource
+    // when the context rate differs from the INPUT device's rate, so create
+    // the context at the mic's own reported rate.
+    const micStream = await Promise.race([
+      navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      }),
+      new Promise((_res, rej) => setTimeout(() => rej(new Error("microphone permission timed out")), 15000)),
+    ]);
+    micStreamRef.current = micStream;
+    const micRate = micStream.getAudioTracks()[0].getSettings().sampleRate || 48000;
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: micRate });
+    audioCtxRef.current = ctx;
+    if (ctx.state === "suspended") await ctx.resume();
+    playNextRef.current = 0;
 
     // mic capture -> int16 PCM -> ws
     const micSource = ctx.createMediaStreamSource(micStream);
@@ -236,6 +243,7 @@ export default function AvatarsChatVoice() {
       }
       wsRef.current.send(int16.buffer);
     };
+    micSource.connect(proc);  // feed the processor — without this its input is unconnected and emits ZEROS
     proc.connect(mute);
     mute.connect(ctx.destination);
 
@@ -398,6 +406,21 @@ export default function AvatarsChatVoice() {
       console.error("Voice connection failed:", e);
       setError(e.message);
       setStatus("error");
+      // Clean up BOTH transports — a failed WS connect must not leave an open
+      // socket or a live server session (that causes the 409 loop).
+      try { wsRef.current?.close(); } catch (_e) {}
+      wsRef.current = null;
+      micStreamRef.current?.getTracks().forEach(t => t.stop());
+      micStreamRef.current = null;
+      if (audioCtxRef.current) { try { await audioCtxRef.current.close(); } catch (_e) {} }
+      audioCtxRef.current = null;
+      if (startRef.current) {
+        await fetch("/api/voice/agent/stop", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ agentId: startRef.current }),
+        }).catch(() => {});
+        startRef.current = null;
+      }
       await disconnect(true);
     }
   };
