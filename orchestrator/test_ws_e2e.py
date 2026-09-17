@@ -66,12 +66,17 @@ async def main():
     downlink = []
     ws = await websockets.connect(f"ws://127.0.0.1:{args.port}", max_size=None)
     print("[ws] connected")
+    # protocol: the client declares its capture rate in a text init frame first
+    await ws.send(json.dumps({"type": "init", "sampleRate": RATE}))
+    t_q_end = [None]
+    t_first = [None]
 
     async def sender():
         chunk = 640
         for off in range(0, len(question_pcm), chunk):
             await ws.send(question_pcm[off:off + chunk])
             await asyncio.sleep(0.02)
+        t_q_end[0] = time.monotonic()
         silence = b"\x00" * 640
         t_last = None
         last_n = 0
@@ -88,6 +93,8 @@ async def main():
         try:
             async for msg in ws:
                 if isinstance(msg, (bytes, bytearray)):
+                    if t_first[0] is None:
+                        t_first[0] = time.monotonic()
                     downlink.extend(struct.unpack("<%dh" % (len(msg) // 2), msg[:len(msg)//2*2]))
         except websockets.ConnectionClosed:
             pass
@@ -98,6 +105,9 @@ async def main():
     await asyncio.sleep(1)
     await ws.close()
     await rx_task
+
+    if t_first[0] and t_q_end[0]:
+        print(f"[timing] question end -> first downlink audio: {t_first[0]-t_q_end[0]:.2f}s")
 
     dur = len(downlink) / RATE
     print(f"[ws] downlink: {len(downlink)} samples = {dur:.1f}s audio "

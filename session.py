@@ -27,7 +27,6 @@ Auto-idle ends the session after idle_timeout_s without user speech.
 import asyncio
 import json
 import array
-import base64
 import queue
 import struct
 import threading
@@ -160,6 +159,7 @@ class VoiceSession:
     # ------------------------- audio out (worker + publisher) -------------------------
     def _tts_worker(self):
         """Sentence text -> Cartesia PCM (prefetch pipeline)."""
+
         while not self._stop.is_set():
             try:
                 gen, text = self._sentence_q.get(timeout=0.2)
@@ -167,122 +167,31 @@ class VoiceSession:
                 continue
             if gen != self._gen:
                 continue  # barged in — drop stale sentence
-            if self.transport in ("rtp", "ws"):
-                self._tts_stream_to_queue(gen, text)
-            else:
-                self._tts_encode_to_queue(gen, text)
-
-    def _tts_stream_to_queue(self, gen, text):
-        """Stream Cartesia PCM into 20 ms frames as it arrives.
-
-        The old path waited for the WHOLE sentence before pushing any audio, so
-        a long opening sentence cost 2-3 s before the avatar made a sound. SSE
-        streaming yields the first frame in a few hundred ms.
-        """
-        _t0 = time.monotonic()
-        first = True
-        pending = bytearray()
-        total = 0
-        self._tts_active += 1
-        try:
-            for pcm in self._tts_stream(text):
-                if gen != self._gen:
-                    return  # barged in
-                if not pcm:
-                    continue
-                if first:
-                    self.log(f"[TIMING] tts first audio: {time.monotonic() - _t0:.2f}s")
-                    first = False
-                total += len(pcm)
-                pending += pcm
-                n = len(pending) // 640
-                if n:
-                    frames = [bytes(pending[i * 640:(i + 1) * 640]) for i in range(n)]
-                    del pending[:n * 640]
-                    self._pcm_q.put((gen, frames))
-            if pending and gen == self._gen:
-                tail = bytes(pending)
-                if len(tail) % 640:
-                    tail += b"\x00" * (640 - len(tail) % 640)
-                self._pcm_q.put((gen, [tail[i:i + 640] for i in range(0, len(tail), 640)]))
-            if total:
-                self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
-                         f"({total // 32000:.1f}s audio)")
-        except Exception as e:
-            self.log(f"[orch] tts stream error: {e}")
-        finally:
-            self._tts_active -= 1
-
-    def _tts_encode_to_queue(self, gen, text):
-        """Agora path: fetch the full sentence, then encode to opus/G722."""
-        _t0 = time.monotonic()
-        self._tts_active += 1
-        try:
+            _t0 = time.monotonic()
             pcm = self._tts(text)
-            if not pcm or gen != self._gen:
-                return
-            self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
-                     f"({len(pcm) // 32000:.1f}s audio)")
-            if len(pcm) % 640:
-                pcm += b"\x00" * (640 - len(pcm) % 640)
-            samples = array.array("h")
-            samples.frombytes(pcm)
-            if self._opus is not None:
-                # one opus packet per 20 ms frame — packets are
-                # variable-length and MUST be pushed individually
-                frames = [self._opus.encode(bytes(samples[k:k + 320]), 320)
-                          for k in range(0, len(samples) - 319, 320)]
-            else:
-                audio = self._enc.encode(samples)
-                frames = [audio[i:i + 160] for i in range(0, len(audio) - 159, 160)]
-            if gen == self._gen:
+            if pcm and gen == self._gen:
+                self.log(f"[TIMING] tts latency: {time.monotonic() - _t0:.2f}s "
+                         f"({len(pcm) // 32000:.1f}s audio)")
+            if self.transport in ("rtp", "ws") and pcm and gen == self._gen:
+                chunks = [pcm[i:i + 640] for i in range(0, len(pcm) - 639, 640)]
+                if len(pcm) % 640:
+                    chunks.append(pcm[-(len(pcm) % 640):].ljust(640, b"\x00"))
+                self._pcm_q.put((gen, chunks))
+                continue
+                if len(pcm) % (2 * 320):
+                    pcm += b"\x00" * (640 - len(pcm) % 640)
+                samples = array.array("h")
+                samples.frombytes(pcm)
+                if self._opus is not None:
+                    # one opus packet per 20 ms frame — packets are
+                    # variable-length and MUST be pushed individually
+                    frames = [self._opus.encode(bytes(samples[k:k + 320]), 320)
+                              for k in range(0, len(samples) - 319, 320)]
+                else:
+                    audio = self._enc.encode(samples)
+                    frames = [audio[i:i + 160] for i in range(0, len(audio) - 159, 160)]
                 self._pcm_q.put((gen, frames))
-        except Exception as e:
-            self.log(f"[orch] tts encode error: {e}")
-        finally:
-            self._tts_active -= 1
-
-    def _tts_stream(self, text):
-        """Yield raw PCM s16le chunks from Cartesia's SSE streaming endpoint."""
-        url = CARTESIA_TTS.replace("/bytes", "/sse")
-        r = None
-        try:
-            r = requests.post(
-                url,
-                headers={"X-API-Key": self.cart_key, "Content-Type": "application/json",
-                         "Cartesia-Version": "2026-08-14", "Accept": "text/event-stream"},
-                json={"transcript": text, "model_id": "sonic-3",
-                      "voice": self.tts_voice_id,
-                      "output_format": {"container": "raw", "encoding": "pcm_s16le",
-                                        "sample_rate": RATE}},
-                stream=True, timeout=30)
-            r.raise_for_status()
-            for raw in r.iter_lines():
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", "replace")
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if not payload:
-                    continue
-                try:
-                    evt = json.loads(payload)
-                except ValueError:
-                    continue
-                if evt.get("type") == "done" or evt.get("done"):
-                    break
-                b64 = evt.get("data")
-                if b64:
-                    yield base64.b64decode(b64)
-        except Exception as e:
-            self.log(f"[orch] TTS stream failed: {e}")
-        finally:
-            if r is not None:
-                try:
-                    r.close()
-                except Exception:
-                    pass
+                self.log(f"[orch] tts ok gen{gen} ({len(pcm)} B): {text[:50]!r}")
 
     def _publisher(self, conn):
         """Frame pump on an ABSOLUTE 20 ms schedule (drift-free playback)."""
@@ -355,9 +264,8 @@ class VoiceSession:
             self._gen += 1
             self._drain(self._sentence_q)
             self._drain(self._pcm_q)
-        self._last_push = 0.0
+            self._last_push = 0.0
         self._push_busy = False
-        self._tts_active = 0             # sentences currently being synthesized
         if self._turn_active:
             return  # previous turn thread cleans up; this utterance handled next
         self._turn_active = True
@@ -420,8 +328,7 @@ class VoiceSession:
             if not self.full_duplex:
                 last_reply = getattr(self, "_reply_gen", None)
                 # wait for this turn's last sentence to be ENCODED (not played):
-                while (self._sentence_q.qsize() > 0 or self._pcm_q.qsize() > 0
-                       or self._tts_active > 0):
+                while self._sentence_q.qsize() > 0 or self._pcm_q.qsize() > 0:
                     time.sleep(0.05)
                 # wait for the publisher to finish PLAYING what it holds
                 while self._push_busy:
@@ -629,53 +536,26 @@ def _ws_patch(cls):
                             self._ws_loop.run_forever()), daemon=True)
         t_loop.start()
 
+        streamer = DeepgramStreamer(
+            self.dg_key, language=self.language,
+            on_interim=lambda t: setattr(self, "_last_activity", time.monotonic()),
+            on_utterance=self._on_utterance)
+
         async def ws_handler(ws):
             self._ws_clients.add(ws)
             self.log(f"[ws] client connected ({len(self._ws_clients)} live)")
+            rx_bytes = 0
             try:
-                msg_n = 0
-                cap = bytearray()
-                cap_max = RATE * 2 * 60   # up to 60 s of uplink saved for diagnosis
-                client_streamer = None    # created on the client's init frame
                 async for msg in ws:
-                    msg_n += 1
-                    if msg_n <= 5 or msg_n % 50 == 0:
-                        self.log(f"[ws] rx frame {msg_n}: {len(msg)} B "
-                                 f"({'binary' if isinstance(msg, (bytes, bytearray)) else type(msg).__name__})")
-                    if not isinstance(msg, (bytes, bytearray)):
-                        # init frame: the client declares its capture rate
-                        try:
-                            d = json.loads(msg)
-                            rate = int(d.get("sampleRate", 16000))
-                        except Exception:
-                            rate = 16000
-                        client_streamer = DeepgramStreamer(
-                            self.dg_key, language=self.language, sample_rate=rate,
-                            on_interim=lambda t: setattr(self, "_last_activity", time.monotonic()),
-                            on_utterance=self._on_utterance)
-                        await client_streamer.connect()
-                        self.log(f"[ws] client init: deepgram connected at {rate} Hz")
-                        continue
-                    if isinstance(msg, (bytes, bytearray)) and len(cap) < cap_max:
-                        cap += bytes(msg[:cap_max - len(cap)])
-                        if len(cap) >= cap_max:
-                            try:
-                                wave_out = "/tmp/uplink_ws_diag.wav"
-                                import wave as _w
-                                with _w.open(wave_out, "wb") as _f:
-                                    _f.setnchannels(1); _f.setsampwidth(2); _f.setframerate(RATE)
-                                    _f.writeframes(bytes(cap))
-                                self.log(f"[ws] uplink sample saved: {wave_out}")
-                            except Exception as e:
-                                self.log(f"[ws] save failed: {e}")
                     if not isinstance(msg, (bytes, bytearray)):
                         continue
-                    try:
-                        if not self.full_duplex and self._muted.is_set():
-                            continue
-                        await client_streamer.send_audio(bytes(msg))
-                    except Exception as e:
-                        self.log(f"[ws] send_audio failed: {e}")
+                    rx_bytes += len(msg)
+                    if rx_bytes // 640 % 25 == 0:
+                        self.log(f"[ws] uplink flowing: {rx_bytes} B received")
+                    if not self.full_duplex and self._muted.is_set():
+                        continue
+                    self._last_activity = max(self._last_activity, time.monotonic())
+                    await streamer.send_audio(bytes(msg))
             except websockets.ConnectionClosed:
                 pass
             except Exception as e:
@@ -687,6 +567,7 @@ def _ws_patch(cls):
         async def _start():
             self._ws_server = await websockets.serve(
                 ws_handler, "0.0.0.0", self.ws_port, max_size=None)
+            await streamer.connect()
         asyncio.run_coroutine_threadsafe(_start(), self._ws_loop).result(20)
 
         t_tts = threading.Thread(target=self._tts_worker, daemon=True)
@@ -712,6 +593,7 @@ def _ws_patch(cls):
         async def _stop_all():
             self._ws_server.close()
             await self._ws_server.wait_closed()
+            await streamer.close()
         asyncio.run_coroutine_threadsafe(_stop_all(), self._ws_loop).result(15)
         self._ws_loop.call_soon_threadsafe(self._ws_loop.stop)
         self._stop_publish.set()
